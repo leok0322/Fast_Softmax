@@ -1,0 +1,452 @@
+cmake_minimum_required(VERSION 3.20)
+
+# 必须在 project() 之前设置，锁定编译器路径，避免多版本共存时误用错误版本
+set(CMAKE_CUDA_COMPILER "/usr/local/cuda/bin/nvcc")
+set(CMAKE_CXX_COMPILER  "/usr/bin/g++")
+
+# project(<项目名> LANGUAGES <语言列表>)
+#   - 声明项目名称为 Fast_Softmax，并启用 CXX（C++）和 CUDA 两种语言
+#   - CMake 会在此阶段探测并配置对应的编译器（g++ / nvcc）
+#   - LANGUAGES 决定了后续 add_library / add_executable 能编译的文件类型：
+#       .cpp  -> g++ 编译为纯主机代码（interface.cpp 中的 pybind11 模块定义）
+#       .cu   -> nvcc 编译为主机 + 设备混合代码（kernels.cu 中的 softmax kernel）
+project(Fast_Softmax LANGUAGES CXX CUDA)
+
+# 导出编译命令到 compile_commands.json，供 clangd / clang-tidy 做代码分析和补全
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+# find_package(CUDAToolkit REQUIRED)：现代 CMake 方式（CMake 3.17+）
+#   提供 IMPORTED target：CUDA::cudart / CUDA::cublas 等
+#   相比旧式 find_package(CUDA)，路径查找更可靠，变量名更规范
+find_package(CUDAToolkit REQUIRED)
+
+# find_package(<包名> [REQUIRED] [COMPONENTS <组件列表>])
+#
+#   Python3    : CMake 内置模块（FindPython3.cmake），专门用于查找 Python3 相关组件
+#                与旧式 FindPythonInterp.cmake 相比，支持 venv / 多版本共存，更可靠
+#
+#   REQUIRED   : 找不到则立即报错终止，不会静默跳过
+#
+#   COMPONENTS Interpreter : 只查找 Python 解释器（python3 可执行文件）
+#     不加 COMPONENTS 时默认查找所有组件，包括：
+#       Interpreter : python3 可执行文件 → Python3_EXECUTABLE
+#       Development : Python.h 头文件 + libpython.so（编译 C 扩展时需要）
+#       NumPy       : numpy 头文件路径
+#     本项目只需要解释器路径（用于 execute_process 查询 EXT_SUFFIX），无需编译链接 Python，
+#     只指定 Interpreter 可加快 cmake 配置速度，避免搜索不需要的组件
+#
+#   成功后设置的变量：
+#     Python3_EXECUTABLE : venv 解释器的完整路径
+#                          如 /home/liam/python_linux/python_venv/.venv/bin/python3
+#     Python3_VERSION    : 解释器版本号（如 3.13.5）
+#
+#   CMake 默认在系统 PATH 中搜索 python3，找到的是系统解释器而非 venv 解释器
+#   需通过以下任一方式将搜索范围锁定到 venv：
+#     -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv
+#                                       CMake 在 .venv/bin/ 下搜索 python3，找到 venv 解释器
+#     -DPython3_EXECUTABLE=/home/liam/python_linux/python_venv/.venv/bin/python3
+#                                       直接锁定到具体可执行文件，跳过任何搜索逻辑，最精确
+#                                       路径来源：venv 激活后执行 which python3 或 readlink -f $(which python3)
+#   两者均在 CLion CMake options 或命令行 cmake -D 中传入；同时指定时 EXECUTABLE 优先
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+message(STATUS "Python3 executable: ${Python3_EXECUTABLE}")
+
+# find_package(Torch REQUIRED)：查找 LibTorch（PyTorch 的 C++ 后端）
+#   设置以下变量：
+#     TORCH_INCLUDE_DIRS   : torch/extension.h 等头文件路径
+#     TORCH_LIBRARIES      : libtorch.so / libtorch_cpu.so 等
+#     TORCH_CXX_FLAGS      : PyTorch 要求的 ABI 标志（如 -D_GLIBCXX_USE_CXX11_ABI=1）
+#     TORCH_INSTALL_PREFIX : LibTorch 安装根目录
+#   需通过 CMAKE_PREFIX_PATH 指定 torch 的 cmake 目录，在 CLion CMake options 中添加：
+#     -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake
+find_package(Torch REQUIRED)
+
+# find_library(<变量名> <库名> [PATHS <路径>] [REQUIRED])
+#   与 find_package 的区别：
+#     find_package : 高层接口，依赖包自带的 XxxConfig.cmake，一次调用同时设置
+#                    头文件路径、库路径、编译标志、IMPORTED target 等所有信息
+#     find_library : 低层接口，只在指定目录下搜索单个 .so / .a 文件，
+#                    把完整路径存入变量，不设置任何头文件路径或编译标志
+#
+#   torch_python 用 find_library 而非 find_package 的原因：
+#     libtorch_python.so 是 PyTorch 的内部子库，没有自己的 TorchPythonConfig.cmake，
+#     find_package(Torch) 也故意未将其包含在 TORCH_LIBRARIES 中（让用户按需链接）；
+#     它没有 CMake 包的身份，只是一个裸 .so，因此只能用 find_library 直接定位文件
+#
+#   参数说明：
+#     TORCH_PYTHON_LIBRARY        : 结果变量，成功后存储 libtorch_python.so 的完整路径
+#     torch_python                : 库名（不含 lib 前缀和 .so 后缀），
+#                                   find_library 自动拼接为 libtorch_python.so 去搜索
+#     PATHS "${TORCH_INSTALL_PREFIX}/lib" : 搜索目录，由 find_package(Torch) 设置的
+#                                           TORCH_INSTALL_PREFIX 展开为 LibTorch 安装根目录
+#     REQUIRED                    : 找不到则报错终止
+find_library(TORCH_PYTHON_LIBRARY torch_python
+    PATHS "${TORCH_INSTALL_PREFIX}/lib"
+    REQUIRED
+)
+
+# include(CheckLanguage)：加载 CMake 内置模块，引入 check_language() 函数
+#   CMake 内置模块位于 /usr/share/cmake-*/Modules/CheckLanguage.cmake
+#   类似 C++ 中的 #include，不加载则 check_language() 未定义，调用会报错
+include(CheckLanguage)
+
+# check_language(CUDA)：探测当前系统是否具备完整可用的 CUDA 编译环境
+#   实际编译一段最小 CUDA 代码来验证 nvcc 能否正常工作
+#   结果写入缓存变量 CMAKE_CUDA_COMPILER：
+#     有效路径（如 /usr/local/cuda/bin/nvcc）：探测成功
+#     NOTFOUND                               ：探测失败
+#
+#   与 project() 阶段的关系：
+#     project(... LANGUAGES CXX CUDA) 已经探测并启用了 CUDA 编译器，
+#     此处 check_language 是额外的防御性验证，确保 nvcc 真正可用，
+#     若不可用则主动 FATAL_ERROR，给出明确报错而非让后续编译命令失败时报出难以定位的错误
+check_language(CUDA)
+if(NOT CMAKE_CUDA_COMPILER)
+    message(FATAL_ERROR "CUDA compiler not found")
+endif()
+
+# PyTorch 2.x 要求至少 C++17；C++20 作为超集向后兼容，可直接使用
+#   注意：PyTorch 某些旧头文件的 volatile 复合赋值在 C++20 下会触发 deprecated 警告
+#         （C++20 弃用了部分 volatile 用法），不影响编译和运行，可忽略
+set(CMAKE_CXX_STANDARD 20)
+# 编译器不支持 C++20 时直接报错终止，而非静默降级到更低标准
+#   不设置（默认）：编译器不支持时悄悄降级（如降到 C++17），你以为在用 C++20 实际没有
+#   设置为 ON    ：不支持则 fatal error，确保编译标志确实是 -std=c++20
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# execute_process(<参数列表>)：在 cmake 配置阶段（而非编译阶段）运行外部命令
+#   与 add_custom_command 的区别：
+#     execute_process   : cmake -S ... -B ... 时立即执行，结果作为配置信息使用
+#     add_custom_command: make / ninja 时执行，属于构建阶段的步骤
+#
+#   COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+#     nvidia-smi        : NVIDIA 系统管理接口，随 GPU 驱动安装，与 CUDA Toolkit 无关
+#     --query-gpu=compute_cap : 查询 GPU 的 Compute Capability，输出格式为 "8.6"
+#     --format=csv,noheader   : 以 CSV 格式输出，去掉表头行，只保留数值
+#     多卡机器每张卡输出一行，此处取第一行（_GPU_CC 只读第一个值）
+#
+#   OUTPUT_VARIABLE _GPU_CC          : 将命令的 stdout 存入变量 _GPU_CC（值为 "8.6"）
+#   OUTPUT_STRIP_TRAILING_WHITESPACE : 去掉末尾换行符，否则 _GPU_CC 为 "8.6\n"，
+#                                      后续 string(REPLACE) 和比较操作会出错
+#   ERROR_QUIET                      : nvidia-smi 不存在时静默失败，不打印错误到终端，
+#                                      不中断 cmake 配置；_GPU_CC 保持为空，
+#                                      由下方 if(NOT _GPU_CC_NUM) 统一报错
+execute_process(
+    COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+    OUTPUT_VARIABLE _GPU_CC
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+# string(REPLACE <匹配串> <替换串> <结果变量> <输入串>)
+#   将 _GPU_CC（"8.6"）中的 "." 替换为 ""，得到 "86" 存入 _GPU_CC_NUM
+#   nvcc 的 -gencode 参数需要无小数点的整数形式（如 86），不接受 "8.6"
+string(REPLACE "." "" _GPU_CC_NUM "${_GPU_CC}")
+
+# if(NOT _GPU_CC_NUM)：变量为空字符串或未定义时条件为真
+#   两种情况会走到这里：
+#     1. nvidia-smi 不存在（ERROR_QUIET 静默，_GPU_CC 为空，_GPU_CC_NUM 也为空）
+#     2. nvidia-smi 存在但输出异常（如权限问题），导致 _GPU_CC 为空
+if(NOT _GPU_CC_NUM)
+    message(FATAL_ERROR "无法检测 GPU 架构，请确认 nvidia-smi 可用")
+endif()
+
+# set(CMAKE_CUDA_ARCHITECTURES <架构号>)：全局设置目标 GPU 的计算能力版本
+#   作用范围：对之后所有 add_library / add_executable 创建的 target 全局生效，
+#             各 target 自动继承，无需逐个调用 set_target_properties(... CUDA_ARCHITECTURES ...)
+#
+#   CMake 内部将其展开为 nvcc 的 -gencode 标志：
+#     -gencode arch=compute_86,code=[sm_86,compute_86]
+#       arch=compute_86 : 以 sm_86 的指令集编译设备代码（输入架构）
+#       code=sm_86      : 生成 sm_86 的 SASS 二进制，在当前 GPU 上直接执行，性能最优
+#       code=compute_86 : 同时保留 PTX 中间码，供未来更新架构的 GPU JIT 编译（向前兼容）
+#
+#   常见架构号对照：
+#     75 = Turing  (RTX 20 系)
+#     80 = Ampere  (A100)
+#     86 = Ampere  (RTX 30 系)
+#     89 = Ada     (RTX 40 系)
+#     90 = Hopper  (H100)
+set(CMAKE_CUDA_ARCHITECTURES ${_GPU_CC_NUM})
+message(STATUS "检测到 GPU Compute Capability: ${_GPU_CC} -> CUDA_ARCHITECTURES=${_GPU_CC_NUM}")
+
+# ── 可配置的 kernel 编译参数 ──────────────────────────────────────────────────
+# 这四个宏对应 kernels.cu 顶部的 #ifndef 默认值，通过 cmake -D 可在配置阶段覆盖
+# 等价于 torch.utils.cpp_extension.load 中的 extra_cuda_cflags / extra_cflags
+#
+#   SOFTMAX_VARIANT : 选择 kernel 实现（1~9），对应 softmax_kernel1~9
+#   BLOCK_DIM_Y     : 每个 block 在 Y 维度的线程数，必须是 2 的幂次（128~1024）
+#   UNROLL_FACTOR   : 循环展开因子（1/2/4/8），用于 kernel7/8/9 的向量化循环
+#   WIDTH           : 行宽静态提示（0 = 运行时由参数决定），非零时允许编译器静态优化
+#
+# 用法示例（选择 variant=6，block_y=512）：
+#   cmake -DSOFTMAX_VARIANT=6 -DBLOCK_DIM_Y=512 ..
+set(SOFTMAX_VARIANT  8    CACHE STRING "Softmax kernel variant (1-9), matches softmax_kernelN")
+set(BLOCK_DIM_Y      1024 CACHE STRING "Block dim Y, power of 2 in [128, 1024]")
+set(UNROLL_FACTOR    8    CACHE STRING "Loop unroll factor for kernel7+: 1/2/4/8")
+set(WIDTH            0    CACHE STRING "Static row width hint; 0 means use runtime argument")
+
+message(STATUS "Kernel config: SOFTMAX_VARIANT=${SOFTMAX_VARIANT}  BLOCK_DIM_Y=${BLOCK_DIM_Y}  UNROLL_FACTOR=${UNROLL_FACTOR}  WIDTH=${WIDTH}")
+
+# ── 全局编译选项 ──────────────────────────────────────────────────────────────
+# add_compile_options 中的生成器表达式在 cmake 配置阶段求值，按条件决定是否将选项写入 build.ninja
+# 各选项对应的 nvcc 实际命令行（以架构 86 为例）：
+#
+#   Debug  模式：nvcc -G -lineinfo --ptxas-options=-v --use_fast_math 不加
+#   Release模式：nvcc    -lineinfo --ptxas-options=-v --use_fast_math
+#
+# Debug 模式：-G 为 GPU 设备代码生成调试符号，供 cuda-gdb 单步调试 kernel
+#   副作用：禁用几乎所有 GPU 优化，性能大幅下降，不可用于性能测量
+add_compile_options("$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:-G>")
+
+# Release 模式：-lineinfo 保留源码行号，让 ncu 能将性能数据映射回源码行
+#   与 -G 的区别：不禁止优化，Release 下 ncu 分析才能反映真实性能
+add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:-lineinfo>")
+
+# --use_fast_math：Release 下将标准数学函数替换为 GPU 硬件内置近似实现，提升性能
+#   实际展开为三个子选项：
+#     -ftz=true       : 把非规格化浮点数（denormal）刷成零，避免硬件慢速处理路径
+#     -prec-div=false : 用快速近似除法替代精确除法
+#     -prec-sqrt=false: 用快速近似平方根替代精确平方根
+#   同时把标准函数自动替换为硬件内置近似版本：
+#     exp()  → __expf()   sin()  → __sinf()   sqrt() → __fsqrt_rn()  ...
+#
+#   本项目 kernels.cu 已直接调用 __expf()，对这部分无额外影响；
+#   主要影响是 -ftz / -prec-div / -prec-sqrt 以及编译器自动替换其他标准函数调用
+#
+#   加此选项的原因：与 benchmark.py 的 JIT 编译参数保持一致
+#     benchmark.py: extra_cuda_cflags=[..., "--use_fast_math", ...]
+#     两种构建路径（JIT / CMake）编译出的 kernel 行为相同，benchmark 结果才可互相对比；
+#     若一个加了一个没加，softmax 数值可能有细微差异，torch.allclose 断言可能因此失败
+add_compile_options("$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--use_fast_math>")
+
+# --ptxas-options=-v：两种模式均开启，输出每个 kernel 的寄存器 / 共享内存用量
+#   Debug 下看未优化代码的资源占用，Release 下看真实资源占用（影响 occupancy）
+#
+#   不加 $<CONFIG:xxx> 条件则两种模式都触发，加了则只在对应模式触发：
+#     两种模式均开启：$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>
+#     只开启 Debug  ：$<$<AND:$<CONFIG:Debug>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>
+#     只开启 Release：$<$<AND:$<CONFIG:Release>,$<COMPILE_LANGUAGE:CUDA>>:--ptxas-options=-v>
+add_compile_options("$<$<COMPILE_LANGUAGE:CUDA>:--ptxas-options=-v>")
+
+# TORCH_CXX_FLAGS 由 find_package(Torch) 设置，通常包含 ABI 标志，如：
+#   "-D_GLIBCXX_USE_CXX11_ABI=1"
+#   必须应用到所有编译单元，否则与 libtorch.so 的 ABI 不匹配，链接时报 undefined reference
+#   原因：PyTorch 编译时选定了一个 ABI 版本，扩展必须用同一版本，否则符号名不同无法链接
+#
+# separate_arguments(<结果变量> <模式> "<输入字符串>")
+#   将空格分隔的字符串拆分为 CMake list（分号分隔），存入结果变量
+#   必须拆分的原因：
+#     TORCH_CXX_FLAGS 是一个普通字符串，如 "-D_GLIBCXX_USE_CXX11_ABI=1 -Wall"
+#     直接传给 add_compile_options("${TORCH_CXX_FLAGS}") 会被当作一个整体选项，
+#     编译器收到的是 "-D_GLIBCXX_USE_CXX11_ABI=1 -Wall"（带空格的单个参数），报错
+#     拆分后变为 CMake list："-D_GLIBCXX_USE_CXX11_ABI=1;-Wall"
+#     add_compile_options 展开 list 后，编译器收到两个独立参数，正确解析
+#
+#   NATIVE_COMMAND：按当前平台的 shell 规则拆分
+#     Linux/macOS : 以空格为分隔符（等价于 UNIX_COMMAND）
+#     Windows     : 以空格为分隔符并处理引号（等价于 WINDOWS_COMMAND）
+#     使用 NATIVE_COMMAND 无需关心平台差异，CMake 自动选择正确规则
+separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+
+# ${TORCH_CXX_FLAGS_LIST} 展开为多个独立参数，每个编译单元（.cu / .cpp）均追加这些标志
+add_compile_options(${TORCH_CXX_FLAGS_LIST})
+
+# ── .o / .so / 可执行文件 的关系 ─────────────────────────────────────────────
+# 三者均为 ELF（Executable and Linkable Format）二进制，ELF 头中的 type 字段区分身份：
+#
+#   .o（目标文件，ET_REL）：单个源文件编译后的中间产物
+#     - 内含机器码片段，但外部符号（如 cudaMalloc / torch::xxx）地址未填，只有占位符
+#     - 不能独立运行，存在意义是增量编译：只有改动的源文件重新生成 .o，
+#       没改的复用旧 .o，最后统一链接，避免每次全量重编
+#
+#   .so（共享对象，ET_DYN）：多个 .o 链接后的完整产物
+#     - 所有符号地址已解析填入，是完整可加载的二进制
+#     - 没有 main() 入口，不能独立运行，须由可执行文件在运行时通过 dlopen() 加载
+#     - PTX 作为数据段嵌入 .o 后随链接进入 .so，驱动运行时从 .so 中读取并 JIT 编译
+#
+#   可执行文件（ET_EXEC / ET_DYN）：有 main() 入口，可独立运行
+#     - 本项目中 python3 是可执行文件，softmax_cuda.so 是它加载的库，两者平行关系：
+#         python3 → import softmax_cuda → dlopen(softmax_cuda.so) → 函数可调用
+#     - .so 不会"变成"可执行文件，也不存在从 .so 到可执行文件的转换路径
+#
+#   完整构建流程对比：
+#
+#   本项目 add_library(softmax_cuda SHARED ...)：
+#     interface.cpp  ──(g++)──▶  interface.cpp.o  ─┐
+#                                                   ├─(ld)──▶  softmax_cuda.so  ← 无入口，须由 python3 dlopen 加载
+#     kernels.cu     ──(nvcc)─▶  kernels.cu.o     ─┘
+#       含 SASS（sm_86）和 PTX（compute_86）两段，均嵌入 .o，链接后进入 .so
+#
+#   参考 GEMM 项目 add_executable(gemm ...)：
+#     gemm.cu        ──(nvcc)──▶  gemm.cu.o       ─┐
+#     sgemm_v1.cu    ──(nvcc)──▶  sgemm_v1.cu.o   ─┤
+#     sgemm_v2.cu    ──(nvcc)──▶  sgemm_v2.cu.o   ─┼─(ld)──▶  gemm  ← 有 main() 入口，./gemm 直接运行
+#     utils.cpp      ──(g++)───▶  utils.cpp.o     ─┘
+#
+#   两者编译阶段完全相同，区别仅在链接阶段：
+#     add_library SHARED → ld 生成无入口的共享库（ET_DYN，无 main）
+#     add_executable     → ld 生成有入口的可执行文件（ET_EXEC / ET_DYN，有 main）
+#
+# ── softmax_cuda 共享库（Python 扩展模块）────────────────────────────────────
+# 构建为 SHARED 库而非可执行文件，Python import 时动态加载 .so
+#   interface.cpp : pybind11 模块定义（PYBIND11_MODULE + torch::Tensor 绑定）
+#   kernels.cu    : 所有 softmax_kernelN 的 CUDA 实现
+add_library(softmax_cuda SHARED interface.cpp kernels.cu)
+
+# Python C 扩展命名规范：无 "lib" 前缀，后缀由 Python 版本和平台决定
+#   PREFIX ""：去掉默认的 "lib" 前缀，生成 softmax_cuda.so 而非 libsoftmax_cuda.so
+#   SUFFIX：使用 Python 平台扩展名（如 .cpython-311-x86_64-linux-gnu.so）
+#           确保 `import softmax_cuda` 能被 Python 正确识别
+#   若不设置 SUFFIX，Python 无法直接 import；生成的裸 .so 仍可被 ctypes 加载
+execute_process(
+    COMMAND ${Python3_EXECUTABLE} -c "import sysconfig; print(sysconfig.get_config_var('EXT_SUFFIX'))"
+    OUTPUT_VARIABLE _PY_EXT_SUFFIX
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+if(_PY_EXT_SUFFIX)
+    set_target_properties(softmax_cuda PROPERTIES PREFIX "" SUFFIX "${_PY_EXT_SUFFIX}")
+    message(STATUS "Python extension suffix: ${_PY_EXT_SUFFIX}")
+else()
+    set_target_properties(softmax_cuda PROPERTIES PREFIX "")
+    message(WARNING "无法检测 Python 扩展后缀，生成裸 .so；若需直接 import，请手动重命名")
+endif()
+
+# 四个 kernel 参数宏作为编译期常量注入，等价于 -DSOFTMAX_VARIANT=8 等
+#   TORCH_EXTENSION_NAME：PYBIND11_MODULE 宏展开时使用此名称作为 Python 模块名
+#                          必须与库文件名（softmax_cuda）一致，否则 import 时报 ImportError
+target_compile_definitions(softmax_cuda PRIVATE
+    TORCH_EXTENSION_NAME=softmax_cuda
+    BLOCK_DIM_Y=${BLOCK_DIM_Y}
+    UNROLL_FACTOR=${UNROLL_FACTOR}
+    SOFTMAX_VARIANT=${SOFTMAX_VARIANT}
+    WIDTH=${WIDTH}
+)
+
+# 头文件搜索路径
+#   CUDAToolkit_INCLUDE_DIRS : /usr/local/cuda/include（cuda_runtime.h 等）
+#   TORCH_INCLUDE_DIRS       : torch/extension.h / torch/torch.h / pybind11 头文件
+target_include_directories(softmax_cuda PRIVATE
+    ${CUDAToolkit_INCLUDE_DIRS}
+    ${TORCH_INCLUDE_DIRS}
+)
+
+# 链接库
+#   CUDA::cudart      : CUDA 运行时（cudaMalloc / kernel 调度等）
+#   ${TORCH_LIBRARIES}: libtorch.so / libtorch_cpu.so / libc10.so 等
+#   ${TORCH_PYTHON_LIBRARY}: libtorch_python.so，PYBIND11_MODULE 展开时需要
+target_link_libraries(softmax_cuda PRIVATE
+    CUDA::cudart
+    ${TORCH_LIBRARIES}
+    ${TORCH_PYTHON_LIBRARY}
+)
+
+# CUDA 设备代码也使用 C++17（与主机代码标准保持一致，避免模板实例化差异）
+set_target_properties(softmax_cuda PROPERTIES
+    CXX_STANDARD  20
+    CUDA_STANDARD 20
+)
+
+# ════════════════════════════════════════════════════════════════════════════
+# 【CLion / CMake 四个操作的含义与对应命令行】
+#
+# ── Reload CMake Project ─────────────────────────────────────────────────
+#   含义：重新执行 CMakeLists.txt，更新构建规则文件（build.ninja / Makefile）
+#         不编译任何源文件，不删除已有 .o 文件
+#   触发时机：修改 CMakeLists.txt 后必须执行，否则新的编译选项不会写入构建规则
+#             修改 SOFTMAX_VARIANT / BLOCK_DIM_Y 等 -D 参数后同样需要 Reload
+#   命令行：
+#     cmake \
+#       -DCMAKE_BUILD_TYPE=Release \                                                  # 构建类型：Release（-O3 -lineinfo）/ Debug（-O0 -G）
+#       -DCMAKE_PREFIX_PATH=.venv/lib/python3.13/site-packages/torch/share/cmake \   # find_package(Torch) 从此目录读取 TorchConfig.cmake
+#       -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv \               # find_package(Python3) 在此 venv 目录下搜索解释器
+#       -DSOFTMAX_VARIANT=8 \                                                         # 选择 softmax_kernel8，注入为编译期宏
+#       -DBLOCK_DIM_Y=1024 \                                                          # block Y 维线程数，注入为编译期宏
+#       -DUNROLL_FACTOR=8 \                                                           # 循环展开因子，注入为编译期宏
+#       -DWIDTH=0 \                                                                   # 行宽静态提示，0 = 运行时由参数决定
+#       -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \                                         # 指定底层构建工具路径为 ninja 可执行文件
+#       -G Ninja \                                                                    # 生成器：生成 build.ninja 而非 Makefile
+#                                                                                     # 选 Ninja 而非 Make 的原因：
+#                                                                                     #   Make  : 每次构建递归扫描完整依赖树再决定重建目标，启动开销大
+#                                                                                     #   Ninja : 依赖图在配置阶段由 CMake 生成完毕，构建时直接查图，
+#                                                                                     #           启动开销极低，并行调度更精确，增量编译速度更快
+#                                                                                     #   本项目 kernels.cu 编译慢，只改 interface.cpp 时
+#                                                                                     #   Ninja 能更快识别并只重编该文件，减少等待
+#                                                                                     #   两者最终产物完全相同，cmake --build 对两者通用
+#       -S /home/liam/cpp_linux/Fast_Softmax \                                       # 源码目录（CMakeLists.txt 所在位置）
+#       -B /home/liam/cpp_linux/Fast_Softmax/cmake-build-release                     # 构建目录（build.ninja / .o / .so 的输出位置）
+#
+#   CLion 中等价配置（Settings → Build, Execution, Deployment → CMake → CMake options）：
+#     -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake
+#     -DPython3_ROOT_DIR=/home/liam/python_linux/python_venv/.venv
+#
+# ── Clean ────────────────────────────────────────────────────────────────
+#   含义：删除所有编译产物（.o 文件、.so 共享库），保留 CMake 配置（build.ninja）
+#         下次 Build 时所有源文件强制重新编译
+#   命令行：
+#     cmake --build cmake-build-release --target clean
+#
+# ── Build（增量编译）────────────────────────────────────────────────────
+#   含义：只重新编译有变化的源文件（kernels.cu / interface.cpp 内容变了），
+#         其余复用已有 .o，最终链接生成 softmax_cuda.cpython-3XX-...so
+#         Ninja 通过文件时间戳 / 内容哈希判断哪些文件需要重编译
+#   注意：CMakeLists.txt 变了但未 Reload，Build 不会感知编译选项的变化
+#         修改了 SOFTMAX_VARIANT 等 -D 参数后，必须先 Reload 再 Build，
+#         否则 kernels.cu 中的 #ifndef 保护不会生效，仍用旧的宏值编译
+#   命令行：
+#     cmake --build cmake-build-release --target softmax_cuda -- -j 18
+#     │      │      │                   │       │              │   │
+#     │      │      │                   │       │              │   └─ 传给底层构建工具（Ninja/Make）的并行参数
+#     │      │      │                   │       │              │      -j 18：同时启动 18 个编译进程
+#     │      │      │                   │       │              └─ "--" 之后的所有参数透传给底层构建工具
+#     │      │      │                   │       │                 cmake 自身不再解析 "--" 之后的内容
+#     │      │      │                   │       └─ 只构建名为 softmax_cuda 的 target
+#     │      │      │                   │          对应 add_library(softmax_cuda SHARED ...)
+#     │      │      │                   └─ --target：指定要构建的目标名称
+#     │      │      └─ 构建目录：cmake 在此目录下寻找 build.ninja / Makefile
+#     │      │         由 cmake -B cmake-build-release 生成（Reload CMake Project 时创建）
+#     │      └─ --build：cmake 进入构建模式（而非配置模式）
+#     └─ cmake 主程序
+#
+#   cmake --build 与 make 的关系：
+#     cmake --build 是对底层构建工具的封装，本项目生成器为 Ninja，
+#     cmake 读取构建目录后实际执行：ninja -C cmake-build-release softmax_cuda -j 18
+#     两者本质等价，区别在于：
+#       cmake --build：生成器无关（Ninja/Make 均适用），可在任意目录执行（路径作参数）
+#       ninja / make ：只对各自生成器有效，必须在含 build.ninja / Makefile 的目录下执行
+#     ninja 的三种等价写法：
+#       cd cmake-build-release && ninja softmax_cuda -j 18   # cd 进去再执行
+#       ninja -C cmake-build-release softmax_cuda -j 18      # -C 指定目录，无需 cd
+#       cmake --build cmake-build-release ...                 # cmake 内部处理 cd
+#
+# ── Rebuild ──────────────────────────────────────────────────────────────
+#   含义：等价于 Clean + Build，先删除所有产物，再完整重新编译
+#         用于解决增量编译状态不一致、头文件依赖混乱等问题
+#   命令行：
+#     cmake --build cmake-build-release --target clean
+#     cmake --build cmake-build-release --target softmax_cuda -- -j 18
+#
+# ── 自动触发说明 ────────────────────────────────────────────────────────
+#   CLion 不会自动执行 Reload 或 Build，两者均需手动触发：
+#     修改 CMakeLists.txt 后：CLion 顶部弹出提示栏，点击 "Reload CMake Project"
+#                             （Settings → CMake → "Reload CMake project on changes" 可开启自动 Reload，
+#                               但默认关闭——因为 Reload 会执行 execute_process，如 nvidia-smi / python，有耗时）
+#     修改 .cu / .cpp 后    ：保存文件，手动点击 Build 或按快捷键，才会触发增量编译
+#                             CLion 不在保存时自动编译，CUDA 单文件编译耗时长，自动触发不合适
+#
+# ── 常见工作流 ──────────────────────────────────────────────────────────
+#   修改 CMakeLists.txt                → 手动 Reload → 手动 Build
+#   修改 SOFTMAX_VARIANT / BLOCK_DIM_Y → 手动 Reload → 手动 Build（宏值变化必须重新配置）
+#   只修改 kernels.cu / interface.cpp  → 手动 Build（增量编译，只重编改动的文件）
+#   编译状态混乱 / 链接报奇怪错误      → 手动 Rebuild
+#   彻底清除重来                        → 删除 cmake-build-release 目录 → 手动 Reload → 手动 Build
+#
+# ── 构建产物与 Python 使用 ──────────────────────────────────────────────
+#   产物路径：cmake-build-release/softmax_cuda.cpython-3XX-x86_64-linux-gnu.so
+#   Python 中加载：
+#     import sys
+#     sys.path.insert(0, '/home/liam/cpp_linux/Fast_Softmax/cmake-build-release')
+#     import softmax_cuda
+#     y = softmax_cuda.softmax_cuda(x)
+# ════════════════════════════════════════════════════════════════════════════
