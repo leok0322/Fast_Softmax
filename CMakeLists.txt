@@ -51,6 +51,17 @@ find_package(CUDAToolkit REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 message(STATUS "Python3 executable: ${Python3_EXECUTABLE}")
 
+# TORCH_CUDA_ARCH_LIST 必须在 find_package(Torch) 之前设置：
+#   PyTorch 的 cuda.cmake 第 322 行检查：if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+#     只要 CMAKE_CUDA_ARCHITECTURES 在 find_package(Torch) 执行时已定义，就触发 Warning：
+#       "pytorch is not compatible with CMAKE_CUDA_ARCHITECTURES and will ignore its value"
+#     并强制 set(CMAKE_CUDA_ARCHITECTURES OFF) 覆盖我们的值
+#   修复方法：
+#     TORCH_CUDA_ARCH_LIST  在 find_package(Torch) 之前设置（此处）← PyTorch 读取此变量
+#     CMAKE_CUDA_ARCHITECTURES 在 find_package(Torch) 之后设置    ← find_package 执行时尚未定义，Warning 不触发
+#   格式：带点版本号 "8.6"（PyTorch 专用），区别于 CMAKE_CUDA_ARCHITECTURES 的无点整数 "86"
+set(TORCH_CUDA_ARCH_LIST "${_GPU_CC}")
+
 # find_package(Torch REQUIRED)：查找 LibTorch（PyTorch 的 C++ 后端）
 #   设置以下变量：
 #     TORCH_INCLUDE_DIRS   : torch/extension.h 等头文件路径
@@ -60,6 +71,25 @@ message(STATUS "Python3 executable: ${Python3_EXECUTABLE}")
 #   需通过 CMAKE_PREFIX_PATH 指定 torch 的 cmake 目录，在 CLion CMake options 中添加：
 #     -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake
 find_package(Torch REQUIRED)
+
+# find_package(Torch) 执行时来自 PyTorch 自身 cmake 文件的三个 Warning：
+#
+#   Warning 1：Failed to compute shorthash for libnvrtc.so
+#     来源：cuda.cmake，PyTorch 对 NVRTC 库做完整性校验时找不到哈希值
+#     影响：无，NVRTC 是运行时编译库，本项目不使用，可忽略
+#
+#   Warning 2：pytorch is not compatible with CMAKE_CUDA_ARCHITECTURES
+#     来源：cuda.cmake 第 322 行 if(DEFINED CMAKE_CUDA_ARCHITECTURES)
+#     原因：CMAKE_CUDA_ARCHITECTURES 在 find_package(Torch) 执行时已定义，
+#           PyTorch cmake 检测到后发出警告并强制 set(CMAKE_CUDA_ARCHITECTURES OFF)
+#     修复：将 CMAKE_CUDA_ARCHITECTURES 移到 find_package(Torch) 之后设置，
+#           PyTorch cmake 运行时变量尚未定义，if(DEFINED ...) 为假，Warning 不触发
+#           TORCH_CUDA_ARCH_LIST 设在此前是为了让 PyTorch 用正确架构，与消除 Warning 无关
+#
+#   Warning 3：static library kineto_LIBRARY-NOTFOUND not found
+#     来源：TorchConfig.cmake，Kineto 是 PyTorch 的性能分析库
+#     原因：此 PyTorch 安装包未编译 Kineto，find_library 找不到
+#     影响：无，Kineto 仅用于 PyTorch 自身的性能分析，不影响 CUDA kernel 编译和运行，可忽略
 
 # find_library(<变量名> <库名> [PATHS <路径>] [REQUIRED])
 #   与 find_package 的区别：
@@ -152,32 +182,22 @@ if(NOT _GPU_CC_NUM)
 endif()
 
 # set(CMAKE_CUDA_ARCHITECTURES <架构号>)：全局设置目标 GPU 的计算能力版本
+#   必须在 find_package(Torch) 之后设置，否则 PyTorch 的 cuda.cmake 检测到该变量已定义，
+#   触发 Warning 并强制将其覆盖为 OFF（见上方 TORCH_CUDA_ARCH_LIST 注释）
+#
 #   作用范围：对之后所有 add_library / add_executable 创建的 target 全局生效，
 #             各 target 自动继承，无需逐个调用 set_target_properties(... CUDA_ARCHITECTURES ...)
-#
 #   CMake 内部将其展开为 nvcc 的 -gencode 标志：
 #     -gencode arch=compute_86,code=[sm_86,compute_86]
-#       arch=compute_86 : 以 sm_86 的指令集编译设备代码（输入架构）
-#       code=sm_86      : 生成 sm_86 的 SASS 二进制，在当前 GPU 上直接执行，性能最优
-#       code=compute_86 : 同时保留 PTX 中间码，供未来更新架构的 GPU JIT 编译（向前兼容）
-#
+#       code=sm_86      : 生成 SASS 二进制，在当前 GPU 上直接执行，性能最优
+#       code=compute_86 : 保留 PTX 中间码，供未来更新架构的 GPU JIT 编译（向前兼容）
 #   常见架构号对照：
-#     75 = Turing  (RTX 20 系)
-#     80 = Ampere  (A100)
-#     86 = Ampere  (RTX 30 系)
-#     89 = Ada     (RTX 40 系)
-#     90 = Hopper  (H100)
-# 不设置全局 CMAKE_CUDA_ARCHITECTURES 时，有两种替代方式效果相同：
-#   1. 逐个 target 设置（每个 target 都要写一遍，繁琐）：
-#        set_target_properties(softmax_cuda PROPERTIES CUDA_ARCHITECTURES 86)
-#   2. cmake 命令行传入：
-#        cmake -DCMAKE_CUDA_ARCHITECTURES=86 ...
-#
-#   三种写法最终均展开为相同的 nvcc 标志：
-#     -gencode arch=compute_86,code=[sm_86,compute_86]
-#   全局 set 最简洁，所有 target 自动继承，无需重复指定
+#     75=Turing(RTX20)  80=Ampere(A100)  86=Ampere(RTX30)  89=Ada(RTX40)  90=Hopper(H100)
+#   不设置全局值时的替代方式（效果相同，但需逐个 target 指定，繁琐）：
+#     set_target_properties(softmax_cuda PROPERTIES CUDA_ARCHITECTURES 86)
+#     cmake -DCMAKE_CUDA_ARCHITECTURES=86 ...
 set(CMAKE_CUDA_ARCHITECTURES ${_GPU_CC_NUM})
-message(STATUS "检测到 GPU Compute Capability: ${_GPU_CC} -> CUDA_ARCHITECTURES=${_GPU_CC_NUM}")
+message(STATUS "GPU Compute Capability: ${_GPU_CC} -> CMAKE_CUDA_ARCHITECTURES=${_GPU_CC_NUM}  TORCH_CUDA_ARCH_LIST=${_GPU_CC}")
 
 # ── 可配置的 kernel 编译参数 ──────────────────────────────────────────────────
 # set(<变量名> <默认值> CACHE <类型> "<描述>")
