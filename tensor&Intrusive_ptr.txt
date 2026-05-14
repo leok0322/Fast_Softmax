@@ -222,10 +222,21 @@ empty_like 的语义：
   using strides_t = c10::SmallVector<int64_t, 5>;
 
   struct Storage {
-      void*    data_ptr_;   // 指向 CPU / GPU 内存
-      size_t   nbytes_;     // 字节数
-      Device   device_;
+      void*    data_ptr_;   // 裸指针，指向 cudaMalloc / malloc 分配的内存首地址
+      size_t   nbytes_;     // 分配的总字节数（= numel × sizeof(dtype)）
+      Device   device_;     // 内存所在设备（CPU / CUDA:0 等）
+
+      // data()：返回 data_ptr_ 的值（void*）
+      //   是 Storage 的唯一对外接口，调用方拿到 void* 后再 static_cast<T*> 使用
+      //   const noexcept：不修改 Storage 的任何字段，不抛出异常
+      //   等价于直接访问 data_ptr_，封装的目的是隐藏字段名、便于子类重写
       void* data() const noexcept { return data_ptr_; }
+
+      // 调用链：
+      //   x.data_ptr<float>()
+      //     → impl_->storage_.data()     // Storage::data()，返回 void*
+      //       → static_cast<float*>(...)  // data_ptr<T>() 内的强转
+      //         → float* 指向 GPU 显存首地址，传给 CUDA kernel
   };
 
   struct TypeMeta { /* 描述元素类型，如 float32 / int64 */ };
@@ -343,12 +354,23 @@ empty_like 的语义：
 
       // ── 数据指针 ────────────────────────────────────────────────────────
 
-      // 返回 void*，指向 CPU/GPU 内存的首元素
+      // 无类型版本：返回 void*，指向 CPU/GPU 内存的首元素
       void* data_ptr() const { return impl_->storage_.data(); }
 
-      // 类型化版本（T 必须与实际 dtype 匹配，否则 UB）
+      // 成员函数模板：类型化版本
+      // template <typename T>：T 由调用方在调用处指定，与 Tensor 类本身无关
+      //   Tensor 是普通类（非类模板），类上不存在任何模板参数，
+      //   T 必须在此独立声明，否则函数体内 T 未定义，编译报错
+      // 同一个 Tensor 对象可以用不同 T 调用，编译器为每个 T 各生成一份函数实例：
+      //   x.data_ptr<float>()    → T=float,   返回 float*
+      //   x.data_ptr<double>()   → T=double,  返回 double*
+      //   x.data_ptr<int8_t>()   → T=int8_t,  返回 int8_t*
+      // T 必须与实际 dtype 匹配，否则是 undefined behavior（类型双关）
       template <typename T>
       T* data_ptr() const {
+          // impl_->storage_.data() 返回 void*（GPU/CPU 显存起始地址）
+          // static_cast<T*>：将 void* 转为 T*，不做任何运行时检查
+          //   等价于：static_cast<T*>(impl_->storage_.data_ptr_)
           return static_cast<T*>(impl_->storage_.data());
       }
 
@@ -2476,7 +2498,85 @@ C++ 中每个表达式都有两个独立属性：类型（type）和值类别（
   | 模板/重载 | 编译期  | 零（内联展开）       | 类型参数化，性能敏感路径  |
 
 --------------------------------------------------------------------------------
-十五、特殊成员函数细节问答
+十五、struct 与 class 的区别
+--------------------------------------------------------------------------------
+
+【15.1 唯一的语法区别：默认访问权限】
+
+  C++ 中 struct 和 class 是同一个概念的两种写法，唯一的语法差异：
+
+  | 关键字 | 成员默认访问权限 | 继承默认访问权限 |
+  |--------|----------------|----------------|
+  | struct | public         | public         |
+  | class  | private        | private        |
+
+  以下两段代码完全等价：
+
+    struct Foo {          class Foo {
+        int x;        ≡    public:
+        void f();             int x;
+    };                        void f();
+                          };
+
+  除此之外，两者支持完全相同的特性：
+    成员函数、静态成员、构造/析构函数、运算符重载、
+    继承、多重继承、虚函数、模板、friend 声明……
+
+【15.2 惯例（Convention）：语义信号】
+
+  选哪个关键字传递给读者不同的设计意图：
+
+  struct → 数据聚合体（aggregate）
+    · 成员全部或大部分 public
+    · 几乎没有封装，无需保护的内部不变量
+    · 逻辑简单，主要用于打包相关数据
+    · 读者看到 struct，预期"直接访问字段即可"
+
+  class → 封装类型
+    · 成员大部分 private，通过接口访问
+    · 存在需要维护的内部不变量（如引用计数始终 ≥ 0）
+    · 读者看到 class，预期"通过公开方法操作，不要直接碰内部字段"
+
+【15.3 本项目中的例子】
+
+  struct Storage {               // 数据聚合体，字段全部 public，只有一个透传方法
+      void*  data_ptr_;
+      size_t nbytes_;
+      Device device_;
+      void* data() const noexcept { return data_ptr_; }
+  };
+  // 选 struct：告诉读者"这里无隐藏状态，可直接读写字段"
+
+  class TensorImpl : public intrusive_ptr_target {  // 有复杂内部状态
+  public:                                           // 显式写 public
+      Storage storage_;
+      // ...
+  };
+  // 选 class：强调封装，默认 private 保护内部字段
+
+  class intrusive_ptr {          // 引用计数管理，ptr_ 必须私有
+      T* ptr_;                   // 默认 private，无需写 private:
+  public:
+      // 只通过公开接口操作
+  };
+
+【15.4 什么时候选哪个（实践原则）】
+
+  用 struct 的场景：
+    · 纯数据容器（POD-like），如坐标、颜色、配置参数
+    · 所有字段均 public，无不变量需要保护
+    · C 风格结构体的 C++ 等价写法
+
+  用 class 的场景：
+    · 有私有字段需要封装
+    · 存在构造函数维护的不变量（如智能指针 ptr_ 不能随意赋值）
+    · 继承层次中作为基类，需要控制访问权限
+
+  两者混用也完全合法，编译器不做强制区分；
+  上述原则是社区约定（C++ Core Guidelines），不是语言规则。
+
+--------------------------------------------------------------------------------
+十六、特殊成员函数细节问答
 --------------------------------------------------------------------------------
 
 【Q1：拷贝赋值为何要 release 旧对象？】

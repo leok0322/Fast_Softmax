@@ -1,0 +1,443 @@
+AT_DISPATCH_FLOATING_TYPES — 完整解析笔记
+================================================================================
+
+一、宏总览
+--------------------------------------------------------------------------------
+
+  AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
+      softmax_kernel<scalar_t><<<grid_size, block_size>>>(
+          x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), w, h);
+  }));
+
+  作用：在运行时根据张量的 dtype 分发到正确的类型化 kernel 调用。
+  本质：C 预处理器宏，在编译期展开为 switch-case，不是函数调用。
+
+  三个参数：
+    第一个：x.scalar_type()     → 运行时 dtype，类型为 c10::ScalarType
+    第二个："softmax_cuda"      → 出错时打印在报错信息中，纯字符串标识
+    第三个：([&] { ... })       → lambda，包含具体的 kernel 启动代码
+
+================================================================================
+二、第一个参数：x.scalar_type() vs 废弃的 x.type()
+================================================================================
+
+【2.1 c10::ScalarType】
+
+  x.scalar_type() 返回 c10::ScalarType 枚举值，例如：
+    c10::ScalarType::Float   → float
+    c10::ScalarType::Double  → double
+    c10::ScalarType::Half    → __half（fp16）
+    c10::ScalarType::BFloat16→ __nv_bfloat16
+
+  AT_DISPATCH_FLOATING_TYPES 的内部实现对 c10::ScalarType 做 switch，
+  宏要求第一个参数的类型就是 c10::ScalarType，直接使用，无需转换。
+
+【2.2 废弃的 x.type() 及其编译报错】
+
+  旧写法：x.type()
+    返回类型：at::DeprecatedTypeProperties
+    类名含 Deprecated 即弃用标志
+
+  问题：新版 PyTorch 移除了从 DeprecatedTypeProperties 到 c10::ScalarType 的隐式转换。
+    传给宏时编译器报错：
+      error: no suitable conversion function from
+             "at::DeprecatedTypeProperties" to "c10::ScalarType" exists
+
+  修复：将 x.type() 替换为 x.scalar_type()
+    x.scalar_type() 直接返回 c10::ScalarType，不经过任何转换。
+
+================================================================================
+三、宏展开 — switch-case + using scalar_t
+================================================================================
+
+【3.1 展开后的等价代码】
+
+  AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
+      softmax_kernel<scalar_t><<<grid_size, block_size>>>(
+          x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), w, h);
+  }));
+
+  展开为：
+
+    switch (x.scalar_type()) {
+      case at::ScalarType::Float: {
+          using scalar_t = float;          // ← 宏注入的类型别名
+          softmax_kernel<scalar_t><<<grid_size, block_size>>>(  // lambda 体原样内联
+              x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), w, h);
+          // scalar_t 在此作用域 == float，编译器据此实例化 softmax_kernel<float>
+          break;
+      }
+      case at::ScalarType::Double: {
+          using scalar_t = double;         // ← 宏注入的类型别名
+          softmax_kernel<scalar_t><<<grid_size, block_size>>>(  // lambda 体原样内联
+              x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), w, h);
+          // scalar_t 在此作用域 == double，编译器实例化 softmax_kernel<double>
+          break;
+      }
+      default:
+          AT_ERROR("\"softmax_cuda\" not implemented for '",
+                   toString(x.scalar_type()), "'");
+    }
+
+【3.2 scalar_t 的可见性】
+
+  ── 问题：lambda 内部如何看到 scalar_t？ ────────────────────────────────────
+
+  宏展开后，case 块的结构是：
+
+    case at::ScalarType::Float: {          // ← case 块开始，新作用域
+        using scalar_t = float;            // ① 宏在此定义类型别名
+        softmax_kernel<scalar_t><<<...>>>( // ② lambda 体原样内联在这里
+            x.data_ptr<scalar_t>(), ...);  //    scalar_t 直接可见
+    }                                      // ← case 块结束
+
+  lambda 体不是作为独立函数插入的，而是被预处理器原样贴入 case 块内，
+  与 ① 和 ② 处于同一个 { } 作用域，因此 scalar_t 在词法上就在 lambda 体的外层。
+
+  ── 词法作用域（lexical scope）─────────────────────────────────────────────
+
+  C++ 的名字查找规则：在某处使用一个名字，编译器从当前位置向外逐层搜索：
+    lambda 体内 → lambda 所在的 case 块 → switch 外层函数 → ...
+
+  scalar_t 定义在 case 块内（lambda 的直接外层），查找时第一层就能找到，
+  无需任何特殊机制。
+
+  ── 为何不需要 [&] 捕获？ ─────────────────────────────────────────────────
+
+  捕获（capture）只针对运行时变量（有地址、有值的对象）：
+    int w = x.size(1);       // 变量，有运行时值，lambda 需用 [&] 或 [=] 捕获
+    float* ptr = ...;        // 变量，同上
+
+  using 声明的是类型别名，不是变量：
+    using scalar_t = float;  // 纯编译期信息，无运行时地址，无法"捕获"
+
+  类型别名在编译期被替换，到运行时已经消失（没有任何内存存储它），
+  捕获列表根本无法捕获一个"类型"，也不需要——编译器通过词法作用域直接解析它。
+
+  ── 对比：变量 vs 类型别名 ──────────────────────────────────────────────────
+
+  | 元素          | 存在阶段 | 有内存地址？ | 需要捕获？ | 查找方式       |
+  |---------------|---------|------------|-----------|----------------|
+  | int w         | 运行时  | 是          | 是（[&]）  | 捕获列表       |
+  | float* ptr    | 运行时  | 是          | 是（[&]）  | 捕获列表       |
+  | using scalar_t| 编译期  | 否          | 否         | 词法作用域查找 |
+  | template<T> T | 编译期  | 否          | 否         | 词法作用域查找 |
+
+  ── 简要总结 ────────────────────────────────────────────────────────────────
+
+  lambda 体被宏内联到 case 块内（同一词法作用域）
+    → scalar_t 由词法作用域直接可见（编译期名字查找）
+    → 不需要捕获（捕获只针对运行时变量，类型别名无运行时存在）
+
+  ── 如果不在同一词法作用域：编译报错 ────────────────────────────────────────
+
+  lambda 的词法作用域是它被**定义**时所在的位置，而非被**调用**时的位置。
+  若 lambda 在 using scalar_t 的外部定义，scalar_t 不在任何外层作用域中，
+  编译器名字查找失败 → 编译报错：error: 'scalar_t' was not declared in this scope
+
+  反例一：lambda 在宏调用前定义
+    // scalar_t 尚未声明
+    auto launcher = [&]() {
+        softmax_kernel<scalar_t><<<...>>>();  // 编译错误：scalar_t 未声明
+    };
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", launcher);
+    // 宏展开时 using scalar_t = float 定义在 case 块内，
+    // 但 launcher 的定义在 case 块外，编译器解析 launcher 体时 scalar_t 不存在
+
+  反例二：预先提取 lambda 到函数
+    void launch(/* 无法传入类型 scalar_t */) {
+        softmax_kernel<scalar_t><<<...>>>();  // 编译错误：scalar_t 未声明
+    }
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&]{
+        launch();  // launch 内看不到 case 块中的 using scalar_t
+    }));
+
+  这正是 AT_DISPATCH_FLOATING_TYPES 必须用宏（而非普通函数）的根本原因：
+    普通函数无法在调用处"注入"一个类型别名到另一个函数的作用域；
+    只有预处理器宏才能做文本替换，把 using scalar_t = float 和 lambda 体
+    贴进同一个 case 块，让两者共享同一词法作用域。
+
+【3.3 编译器为每种类型各生成一份模板实例】
+
+  宏展开后两个 case 块各含一次 kernel 调用，scalar_t 别名不同：
+    case Float:  using scalar_t = float;  → softmax_kernel<scalar_t> 实例化为 softmax_kernel<float>
+    case Double: using scalar_t = double; → softmax_kernel<scalar_t> 实例化为 softmax_kernel<double>
+
+  NVCC 为每个模板实例各生成一份 PTX / SASS 机器码（两份独立代码）。
+  运行时只进入其中一个 case，无运行时类型转换开销。
+
+  对比运行时多态（虚函数）：
+    虚函数 → 运行时查 vtable → 一份代码，靠分支决定行为
+    AT_DISPATCH → 编译期为每种类型展开 → 多份代码，运行时只选其一
+
+================================================================================
+四、第三个参数：lambda ([&] { ... })
+================================================================================
+
+【4.1 C++ lambda 完整语法】
+
+  [捕获列表](参数列表) -> 返回类型 { 函数体 }
+
+  示例中的 lambda：
+    [&] { softmax_kernel<scalar_t><<<...>>>(...); }
+
+  省略了参数列表 () 和返回类型 -> void：
+    无参数时，() 可以整体省略（C++11 起允许）
+    返回类型为 void 且编译器可推导时，-> void 可省略
+
+  完整等价写法：
+    [&]() -> void { softmax_kernel<scalar_t><<<...>>>(...); }
+
+【4.2 [&] 按引用捕获】
+
+  [&]：捕获外层作用域内所有局部变量（按引用），lambda 内直接访问，无需参数传递。
+    捕获的变量：grid_size, block_size, x, out, w, h
+    按引用不复制变量：对 torch::Tensor 等对象避免不必要的拷贝构造（ref_count++）
+
+  为何不捕获 scalar_t：
+    scalar_t 是类型别名（using scalar_t = float），不是变量，
+    捕获列表只捕获变量，类型别名由宏在 lambda 的词法作用域内定义，直接可见。
+
+  对比 [=]（按值捕获）：
+    [=] 拷贝所有可见局部变量到 lambda 的闭包对象
+    [&] 只在闭包内存储对每个变量的引用（指针），不拷贝
+    此处 lambda 生命周期短于外层函数（宏内立即调用），[&] 无悬空引用风险
+
+【4.3 外层括号 ([&] { ... }) 的作用】
+
+  AT_DISPATCH_FLOATING_TYPES 是 C 预处理器宏，参数以逗号分隔。
+
+  问题：lambda 体内的 CUDA kernel 启动含多个逗号：
+    softmax_kernel<scalar_t><<<grid_size, block_size>>>(
+        x.data_ptr<scalar_t>(), out.data_ptr<scalar_t>(), w, h);
+
+  不加外层括号时，预处理器把 lambda 内部的逗号误认为宏的参数分隔符：
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", [&] {
+        softmax_kernel<scalar_t><<<grid_size              // ← 宏认为第3个参数到此结束
+        ...
+
+    → 编译器报 "too many arguments to macro"
+
+  加外层括号后，预处理器把 ([&] { ... }) 视为单一 token（括号内不分割逗号）：
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] { ... }));
+    ─────────────────────────── ───────────────  ──────────────  ────────────
+           参数1                    参数2              参数3（整体）
+
+================================================================================
+五、CUDA kernel 启动语法 <<<grid_size, block_size>>>
+================================================================================
+
+【5.1 执行配置四个参数】
+
+  kernel<<<grid, block, shared_mem, stream>>>(args...);
+
+  参数1 grid_size  (dim3)：grid 形状，决定启动多少个 block
+  参数2 block_size (dim3)：block 形状，决定每个 block 内多少线程
+  参数3 shared_mem (size_t)：动态 shared memory 字节数，省略时默认 0
+  参数4 stream     (cudaStream_t)：CUDA stream，省略时默认 0（默认 stream）
+
+  本项目中使用两个参数（后两个取默认值）：
+    softmax_kernel<scalar_t><<<grid_size, block_size>>>(...)
+
+【5.2 dim3 结构体】
+
+  dim3 是 CUDA 内置结构体，三个字段 x, y, z 表示三个维度。
+
+  示例（variant 1）：
+    block_size = dim3(32, 32, 1)   → 每个 block 有 32 × 32 = 1024 个线程
+    grid_size  = dim3(w/32, h/32, 1) → 整个 grid 有 (w/32) × (h/32) 个 block
+
+  总线程数 = (w/32 × h/32) × (32 × 32) = w × h（每个元素一个线程，理想情况）
+
+  整数除法问题：
+    w/32 是 C++ 整数除法，向下截断（例如 w=100 → grid 只有 3，覆盖 96 个元素）
+    若 w 不是 32 倍数，需在 kernel 内做边界检查：if (row < h && col < w)
+
+【5.3 本项目 variant 2-9 的配置（默认值）】
+
+  block_size = dim3(1, BLOCK_DIM_Y, 1)   → 每 block 有 BLOCK_DIM_Y 个线程（y 方向）
+  grid_size  = dim3(h, 1, 1)             → 每行一个 block（x 方向共 h 个 block）
+
+  kernel 内：
+    int row = blockIdx.x;    // 行索引 = block 在 x 方向的编号
+    int ty  = threadIdx.y;   // 列方向的线程编号，范围 [0, BLOCK_DIM_Y)
+    一个 block 负责一整行，BLOCK_DIM_Y 个线程分摊该行的所有元素
+
+================================================================================
+六、data_ptr<scalar_t>() — 从 Tensor 取出裸指针
+================================================================================
+
+【6.1 为何不能直接把 torch::Tensor 传给 kernel】
+
+  torch::Tensor 是高层 C++ 对象，内部持有：
+    shape (sizes)、stride、dtype、device 等元数据
+    以及一个 intrusive_ptr<TensorImpl>（引用计数智能指针）
+
+  CUDA __global__ kernel 只接受 POD 类型参数（int、float*、结构体等）：
+    GPU 不能调用 C++ 构造/析构函数
+    GPU 不能访问 C++ 虚函数表（vtable）
+    torch::Tensor 含有指针、虚函数、引用计数，无法直接传给 kernel
+
+  必须剥离元数据，只传裸指针：
+    x.data_ptr<scalar_t>()   → GPU 显存地址（scalar_t*），传给 kernel 的 a 参数
+    out.data_ptr<scalar_t>() → GPU 显存地址（scalar_t*），传给 kernel 的 b 参数
+
+【6.2 data_ptr<scalar_t>() 的内部实现】
+
+  template <typename T>   // ← 成员函数模板，T 在此独立声明
+  T* data_ptr() const {
+      return static_cast<T*>(storage_.data());
+      // storage_.data() 返回 GPU 显存起始地址（void*）
+      // static_cast<T*>：将 void* 转为具体类型指针，等价于：
+      //   static_cast<scalar_t*>(impl_->storage_.data_ptr_)
+  }
+
+  ── 为何成员函数需要自己的 template <typename T>，而不能直接用 T ──────────────
+
+  原因一：torch::Tensor 本身不是类模板
+    class Tensor { ... };       // 普通类，类上没有任何模板参数
+    类上根本不存在 T，成员函数若直接写 T* data_ptr()，编译器报 T 未声明。
+
+  原因二：即使类有模板参数，成员函数的 T 也是独立的
+    假设类是 template<typename U> class Foo，U 在构造时固定（如 Foo<int>）。
+    成员函数的 T 由调用方在调用时独立选择，与类的 U 无关：
+      x.data_ptr<float>()    // T = float  → 返回 float*
+      x.data_ptr<double>()   // T = double → 返回 double*
+      x.data_ptr<int8_t>()   // T = int8_t → 返回 int8_t*
+    同一个 Tensor 对象可以用不同 T 调用，编译器为每个 T 各生成一份函数实例。
+    如果 T 绑定在类模板上，类实例化时就固定了，无法在调用时按需选择。
+
+  结论：
+    template <typename T> 在成员函数上声明的是"成员函数模板"，
+    T 的含义是"调用方在调用处指定的类型"，与类本身是否是模板无关。
+    没有这行声明，T 在函数作用域内不存在，编译直接报错。
+
+  scalar_t 由 AT_DISPATCH_FLOATING_TYPES 确定：
+    dtype = float  → scalar_t = float  → 返回 float*
+    dtype = double → scalar_t = double → 返回 double*
+
+  类型必须与实际 dtype 匹配，否则是 undefined behavior（类型双关）。
+
+【6.3 x 和 out 的区别】
+
+  x：softmax_cu(torch::Tensor x) 的函数参数，Python 侧传入的输入张量
+
+    C++ 类型：torch::Tensor（按值传参，非指针、非引用）
+      torch::Tensor 是轻量句柄，内部只有一个成员：
+        intrusive_ptr<TensorImpl, UndefinedTensorImpl> impl_;  // 8 bytes
+      sizeof(torch::Tensor) == 8（64位平台）
+
+    按值传参的含义：
+      softmax_cu(torch::Tensor x) 在调用时触发拷贝构造：
+        impl_ 拷贝构造 → retain_() → TensorImpl 的 refcount++
+      函数返回时 x 析构 → release_() → refcount--
+      整个过程只有一次原子加、一次原子减，GPU 显存不动
+
+    x 的内部结构（由内向外）：
+      GPU 显存（cudaMalloc）
+        ↑ Storage::data_ptr_ 指向这里
+      TensorImpl（堆上，继承 intrusive_ptr_target）
+        ├─ refcount_   : 引用计数（atomic<uint32_t>，嵌入 TensorImpl 内部）
+        ├─ storage_    : Storage（含 data_ptr_ → GPU 显存首地址）
+        ├─ sizes_      : SmallVector<int64_t>，如 [h, w]
+        ├─ strides_    : SmallVector<int64_t>，行主序时 [w, 1]
+        ├─ dtype_      : TypeMeta（float32 / double 等）
+        └─ device_     : Device（cuda:0 等）
+      intrusive_ptr<TensorImpl, UndefinedTensorImpl>（8 bytes，只有一个裸指针 ptr_）
+        ↑ impl_
+      torch::Tensor（函数参数 x，栈上，8 bytes）
+
+    关键字段与本函数的关联：
+      x.scalar_type() → TensorImpl::dtype_  → c10::ScalarType（宏第一个参数）
+      x.size(0)       → TensorImpl::sizes_[0] → h（行数）
+      x.size(1)       → TensorImpl::sizes_[1] → w（列数）
+      x.data_ptr<T>() → Storage::data_ptr_   → GPU 显存裸指针（传给 kernel）
+
+    形状 [h, w]，数据已存在于 GPU 显存
+    在 kernel 内对应参数 a（标注 __restrict__），只读
+
+  out：torch::empty_like(x) 创建的输出张量
+    形状和 dtype 与 x 完全相同（empty_like 拷贝元数据）
+    PyTorch 分配一块全新的 GPU 显存，内容未初始化
+    empty_like 不初始化内容（kernel 会覆盖所有元素，零初始化是浪费开销）
+    在 kernel 内对应参数 b（标注 __restrict__），只写
+    softmax_cu 最终将 out 作为返回值传回 Python
+
+【6.4 内存归属与生命周期】
+
+  两块 GPU 显存都由 PyTorch（通过 TensorImpl + Storage）管理生命周期：
+    分配：empty_like 调用 cudaMalloc（经由 PyTorch 的 caching allocator）
+    释放：Tensor 的 ref_count 降为 0 时，~Storage() → cudaFree()
+
+  kernel 只是借用指针进行读写，不负责内存管理：
+    kernel 读 a[row*w + i]    → 读 x 的显存
+    kernel 写 b[row*w + i]    → 写 out 的显存
+
+================================================================================
+七、__restrict__ 限定符
+================================================================================
+
+  template <typename scalar_t>
+  __global__ void softmax_kernel(scalar_t* __restrict__ a,
+                                  scalar_t* __restrict__ b, int w, int h)
+
+  __restrict__ 是编译器提示：a 和 b 指向的内存区域不重叠（不存在指针别名）。
+
+  作用：
+    允许编译器更激进地优化（减少重复内存读取，提升寄存器重用）
+    NVCC 可以将 a 的读取缓存在寄存器中，不必每次重新从内存加载
+    如果 a 和 b 实际上重叠，行为未定义（但 softmax out-of-place，必然不重叠）
+
+  对应 C 标准的 restrict 关键字（C++ 中不是标准，但 CUDA / GCC / Clang 均支持）。
+
+================================================================================
+八、完整调用链示意（以 variant 8 为例）
+================================================================================
+
+  Python 调用：
+    out = softmax_cu_ext.softmax_cu(x)   # x: float32, shape [h, w]
+
+  C++ 入口 softmax_cu(torch::Tensor x)：
+    auto out = torch::empty_like(x);    // 分配 [h, w] float32 GPU 内存
+    int h = x.size(0);  int w = x.size(1);
+    dim3 block_size(1, BLOCK_DIM_Y, 1);
+    dim3 grid_size(h, 1, 1);
+
+    AT_DISPATCH_FLOATING_TYPES(x.scalar_type(), "softmax_cuda", ([&] {
+        // 宏展开，x.scalar_type() == Float → 进入 Float case：
+        //   using scalar_t = float;
+        softmax_kernel8<float><<<grid_size, block_size>>>(
+            x.data_ptr<float>(),    // float* 指向 x 的 GPU 显存
+            out.data_ptr<float>(),  // float* 指向 out 的 GPU 显存
+            w, h);
+    }));
+
+    return out;  // 将 out 句柄返回给 Python，Python 接管 ref_count
+
+  GPU 内核执行（每个 block 处理一行）：
+    softmax_kernel8<float>：
+      a = x.data_ptr<float>()    → GPU 显存首地址（只读）
+      b = out.data_ptr<float>()  → GPU 显存首地址（只写）
+      在线程间做 max-reduction 和 sum-reduction（shared memory / warp shuffle）
+      写入 b[row*w + i] = exp(a[row*w + i] - maxval) / divisor
+
+================================================================================
+九、汇总表
+================================================================================
+
+  | 元素                         | 类型/值                     | 说明                          |
+  |------------------------------|----------------------------|-------------------------------|
+  | AT_DISPATCH_FLOATING_TYPES   | C 预处理器宏                | 运行时 dtype → 编译期 switch  |
+  | x.scalar_type()              | c10::ScalarType (枚举)      | 运行时 dtype，宏第一个参数    |
+  | x.type()（废弃）             | at::DeprecatedTypeProperties| 新版无法隐式转换，编译报错    |
+  | "softmax_cuda"               | const char*                 | 报错时的定位标识              |
+  | ([&] { ... })                | lambda，外层 () 防预处理歧义| 宏第三个参数，内含 kernel 调用|
+  | [&]                          | 按引用捕获所有局部变量      | 不拷贝 Tensor，只借引用       |
+  | scalar_t                     | using 类型别名              | 由宏在 case 块内定义，不被捕获|
+  | <<<grid, block>>>            | CUDA 执行配置               | 决定 block 数和线程数         |
+  | dim3                         | CUDA 内置结构体             | 表示三维网格/block 形状       |
+  | data_ptr<scalar_t>()         | scalar_t*                   | 剥离 Tensor 元数据，取裸指针  |
+  | torch::empty_like(x)         | torch::Tensor               | 新分配 GPU 内存，不初始化内容 |
+  | __restrict__                 | 编译器提示                  | a/b 不重叠，允许更激进优化    |
+
+================================================================================
