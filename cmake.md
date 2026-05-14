@@ -78,20 +78,33 @@ CMake 3.17+ 的现代方式，提供 IMPORTED target：`CUDA::cudart` / `CUDA::c
 ### find_package(Python3)
 
 ```cmake
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
 ```
 
 | 参数 | 说明 |
 |------|------|
 | `REQUIRED` | 找不到则立即报错终止 |
-| `COMPONENTS Interpreter` | 只查找 Python 解释器（`python3` 可执行文件） |
+| `COMPONENTS Interpreter` | 查找 Python 解释器（`python3` 可执行文件） |
+| `COMPONENTS Development` | 查找 Python 开发头文件和库（`Python.h` / `libpython.so`） |
 
-只指定 `Interpreter` 组件的原因：本项目只需要解释器路径（用于 `execute_process` 查询 `EXT_SUFFIX`），无需编译链接 Python，避免搜索 `Development` / `NumPy` 等不需要的组件。
+**为什么需要 `Development` 组件：**
+
+```
+torch/extension.h → torch/csrc/python_headers.h → <Python.h>
+```
+
+编译 `interface.cpp` 时 `torch/extension.h` 的包含链最终需要 `Python.h`。若只指定 `Interpreter`，`Python3_INCLUDE_DIRS` 不会被设置，编译报：
+
+```
+fatal error: Python.h: No such file or directory
+```
 
 **成功后设置的变量：**
 
 - `Python3_EXECUTABLE`：venv 解释器的完整路径，如 `/home/liam/python_linux/python_venv/.venv/bin/python3`
 - `Python3_VERSION`：解释器版本号，如 `3.13.5`
+- `Python3_INCLUDE_DIRS`：`Python.h` 所在目录，如 `/usr/include/python3.13`
+- `Python3_LIBRARIES`：`libpython.so` 完整路径
 
 **指定 venv 解释器的两种方式（在 CLion CMake options 或命令行 `-D` 中传入）：**
 
@@ -200,6 +213,46 @@ endif()
 - `check_language(CUDA)`：实际编译一段最小 CUDA 代码来验证 nvcc 能否正常工作
   - 结果写入缓存变量 `CMAKE_CUDA_COMPILER`：有效路径表示成功，`NOTFOUND` 表示失败
 - `project(... LANGUAGES CUDA)` 已探测编译器，此处是额外的防御性验证，不可用时主动报 `FATAL_ERROR`，比等编译命令失败时的报错更易定位
+
+**错误：`CUDA_ARCHITECTURES is empty for target "cmTC_0c802"`**
+
+```
+CMake Error in CMakeLists.txt:
+  CUDA_ARCHITECTURES is empty for target "cmTC_0c802".
+```
+
+- `cmTC_0c802`：`check_language(CUDA)` 在内部创建的临时测试 target，名称由 CMake 随机生成
+- 报错原因：`check_language(CUDA)` 编译测试程序时，`CMAKE_CUDA_ARCHITECTURES` 为空，nvcc 不知道目标架构，编译失败
+- 触发场景：`unset(CMAKE_CUDA_ARCHITECTURES CACHE)` 清除了架构值，而 `set(CMAKE_CUDA_ARCHITECTURES ...)` 的位置在 `check_language(CUDA)` 之后，执行到 `check_language` 时变量仍为空
+
+**修复：严格的四步顺序**
+
+```cmake
+# 1. 查询 GPU 架构 → _GPU_CC = "8.6"，_GPU_CC_NUM = "86"
+execute_process(COMMAND nvidia-smi ...)
+string(REPLACE "." "" _GPU_CC_NUM "${_GPU_CC}")
+
+# 2. 告知 PyTorch 目标架构（find_package(Torch) 之前）
+set(TORCH_CUDA_ARCH_LIST "${_GPU_CC}")
+# 3. 清除旧缓存值，防止 pytorch 的 Warning 2（find_package(Torch) 之前）
+unset(CMAKE_CUDA_ARCHITECTURES CACHE)
+
+# 4. PyTorch 读取 TORCH_CUDA_ARCH_LIST，此时 CMAKE_CUDA_ARCHITECTURES 未定义，不触发 Warning
+find_package(Torch REQUIRED)
+
+# 5. 设置 CMAKE_CUDA_ARCHITECTURES（find_package(Torch) 之后，check_language 之前）
+set(CMAKE_CUDA_ARCHITECTURES ${_GPU_CC_NUM})
+
+# 6. check_language 编译测试时 CMAKE_CUDA_ARCHITECTURES 已有值，不报错
+check_language(CUDA)
+```
+
+| 约束 | 原因 |
+|------|------|
+| `nvidia-smi` 在 `find_package(Torch)` 之前 | `TORCH_CUDA_ARCH_LIST` 须在 `find_package(Torch)` 前设好，依赖 `_GPU_CC` |
+| `unset(CACHE)` 在 `find_package(Torch)` 之前 | PyTorch cuda.cmake 检查时 `CMAKE_CUDA_ARCHITECTURES` 必须未定义 |
+| `set(CMAKE_CUDA_ARCHITECTURES)` 在 `find_package(Torch)` 之后 | 若在之前设置，触发 PyTorch Warning 2 并被强制覆盖为 OFF |
+| `set(CMAKE_CUDA_ARCHITECTURES)` 在 `check_language` 之前 | `check_language` 编译测试 target 时需要非空的架构值 |
 
 ---
 
@@ -441,16 +494,59 @@ g++  src/interface.cpp ... -D_GLIBCXX_USE_CXX11_ABI=1
 
 ## 6. 共享库构建
 
+### aux_source_directory
+
+```cmake
+aux_source_directory(${PROJECT_SOURCE_DIR}/src/kernels KERNELS)
+```
+
+扫描指定目录，将其中所有已知扩展名的源文件（`.cu` / `.cpp` / `.c` 等）收集到变量中。
+
+**参数说明：**
+
+- 第一个参数：要扫描的目录路径
+- 第二个参数：结果变量名，收集到的文件列表以分号分隔存入该变量（CMake list 格式）
+
+**特性与注意事项：**
+
+| 特性 | 说明 |
+|------|------|
+| 非递归 | 只扫描指定目录本身，不递归进入子目录 |
+| 已知扩展名 | CMake 内置列表：`.c` `.cpp` `.cxx` `.cc` `.cu` 等；`.cuh` / `.h` 不会被收集 |
+| 新增文件需 Reload | `aux_source_directory` 在配置阶段（Reload）执行一次，之后新增的文件不会自动加入，必须再次 Reload |
+
+**与手动列举源文件的区别：**
+
+```cmake
+# 手动列举（新增文件必须手动加）：
+add_library(softmax_cuda SHARED src/kernels/softmax_kernel.cu)
+
+# aux_source_directory（新增 .cu 文件后 Reload 即可自动收集）：
+aux_source_directory(${PROJECT_SOURCE_DIR}/src/kernels KERNELS)
+add_library(softmax_cuda SHARED ${KERNELS})
+```
+
 ### add_library
 
 ```cmake
-add_library(softmax_cuda SHARED src/interface.cpp src/kernels.cu)
+aux_source_directory(${PROJECT_SOURCE_DIR}/src/kernels KERNELS)
+
+add_library(softmax_cuda SHARED
+    src/interface.cpp   # g++  编译：pybind11 模块定义，纯主机代码
+    src/kernels.cu      # nvcc 编译：kernel 调度函数 softmax_cu()，主机 + 设备混合代码
+    ${KERNELS}          # nvcc 编译：src/kernels/ 下的各 kernel 实现（如 softmax_kernel.cu）
+)
 ```
 
-构建为 SHARED 库而非可执行文件，Python `import` 时动态加载 `.so`：
+构建为 SHARED 库而非可执行文件，Python `import` 时动态加载 `.so`。每个源文件由 CMake 根据扩展名选择编译器独立编译：
 
-- `interface.cpp`：pybind11 模块定义（`PYBIND11_MODULE` + `torch::Tensor` 绑定）
-- `kernels.cu`：所有 `softmax_kernelN` 的 CUDA 实现
+| 源文件 | 编译器 | 产物 |
+|--------|--------|------|
+| `src/interface.cpp` | `g++` | `interface.cpp.o`（纯主机代码） |
+| `src/kernels.cu` | `nvcc` | `kernels.cu.o`（主机 + 设备混合） |
+| `src/kernels/softmax_kernel.cu` | `nvcc` | `softmax_kernel.cu.o`（kernel 实现） |
+
+三个 `.o` 最终由链接器合并为 `softmax_cuda.so`。
 
 ### Python 扩展文件名
 
@@ -552,6 +648,7 @@ WIDTH=${WIDTH}                     →  -DWIDTH=0
 target_include_directories(softmax_cuda PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
     ${TORCH_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
 )
 ```
 
@@ -559,6 +656,9 @@ target_include_directories(softmax_cuda PRIVATE
 |------|------|
 | `CUDAToolkit_INCLUDE_DIRS` | `/usr/local/cuda/include`（`cuda_runtime.h` 等） |
 | `TORCH_INCLUDE_DIRS` | `torch/extension.h` / `torch/torch.h` / `pybind11` 头文件 |
+| `Python3_INCLUDE_DIRS` | `Python.h` 所在目录，由 `find_package(Python3 ... Development)` 提供 |
+
+`Python3_INCLUDE_DIRS` 必须显式加入的原因：`TORCH_INCLUDE_DIRS` 只包含 PyTorch 自身的头文件目录，不包含 Python 头文件目录；但 `torch/extension.h` 在其包含链中需要 `Python.h`，若不加入此目录，编译 `interface.cpp` 时会报 `Python.h: No such file or directory`。
 
 ### target_link_libraries
 

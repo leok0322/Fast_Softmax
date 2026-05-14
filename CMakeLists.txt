@@ -48,20 +48,64 @@ find_package(CUDAToolkit REQUIRED)
 #                                       直接锁定到具体可执行文件，跳过任何搜索逻辑，最精确
 #                                       路径来源：venv 激活后执行 which python3 或 readlink -f $(which python3)
 #   两者均在 CLion CMake options 或命令行 cmake -D 中传入；同时指定时 EXECUTABLE 优先
-find_package(Python3 REQUIRED COMPONENTS Interpreter)
+find_package(Python3 REQUIRED COMPONENTS Interpreter Development)
+# Development 组件额外提供：
+#   Python3_INCLUDE_DIRS : Python.h 所在目录
+#   Python3_LIBRARIES    : libpython.so
+# 编译时需要 Python.h 的原因：
+#   torch/extension.h → torch/csrc/python_headers.h → <Python.h>
 message(STATUS "Python3 executable: ${Python3_EXECUTABLE}")
+message(STATUS "Python3 include dirs: ${Python3_INCLUDE_DIRS}")
 
-# TORCH_CUDA_ARCH_LIST 必须在 find_package(Torch) 之前设置：
-#   PyTorch 的 cuda.cmake 第 322 行检查：if(DEFINED CMAKE_CUDA_ARCHITECTURES)
-#     只要 CMAKE_CUDA_ARCHITECTURES 在 find_package(Torch) 执行时已定义，就触发 Warning：
-#       "pytorch is not compatible with CMAKE_CUDA_ARCHITECTURES and will ignore its value"
-#     并强制 set(CMAKE_CUDA_ARCHITECTURES OFF) 覆盖我们的值
-#   修复方法：
-#     TORCH_CUDA_ARCH_LIST  在 find_package(Torch) 之前设置（此处）← PyTorch 读取此变量
-#     CMAKE_CUDA_ARCHITECTURES 在 find_package(Torch) 之后设置    ← find_package 执行时尚未定义，Warning 不触发
-#   格式：带点版本号 "8.6"（PyTorch 专用），区别于 CMAKE_CUDA_ARCHITECTURES 的无点整数 "86"
+# ── GPU 架构检测（必须在 find_package(Torch) 之前，使 _GPU_CC 可用）────────────
+# execute_process(<参数列表>)：在 cmake 配置阶段（而非编译阶段）运行外部命令
+#   与 add_custom_command 的区别：
+#     execute_process   : cmake -S ... -B ... 时立即执行，结果作为配置信息使用
+#     add_custom_command: make / ninja 时执行，属于构建阶段的步骤
+#
+#   COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+#     nvidia-smi              : NVIDIA 系统管理接口，随 GPU 驱动安装，与 CUDA Toolkit 无关
+#     --query-gpu=compute_cap : 查询 GPU 的 Compute Capability，输出格式为 "8.6"
+#     --format=csv,noheader   : 以 CSV 格式输出，去掉表头行，只保留数值
+#     多卡机器每张卡输出一行，此处取第一行（_GPU_CC 只读第一个值）
+#
+#   OUTPUT_VARIABLE _GPU_CC          : 将命令的 stdout 存入变量 _GPU_CC（值为 "8.6"）
+#   OUTPUT_STRIP_TRAILING_WHITESPACE : 去掉末尾换行符，否则 _GPU_CC 为 "8.6\n"
+#   ERROR_QUIET                      : nvidia-smi 不存在时静默失败，_GPU_CC 保持为空
+execute_process(
+    COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+    OUTPUT_VARIABLE _GPU_CC
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+)
+
+# string(REPLACE <匹配串> <替换串> <结果变量> <输入串>)
+#   将 _GPU_CC（"8.6"）中的 "." 替换为 ""，得到 "86" 存入 _GPU_CC_NUM
+#   nvcc 的 -gencode 参数需要无小数点的整数形式（如 86），不接受 "8.6"
+string(REPLACE "." "" _GPU_CC_NUM "${_GPU_CC}")
+
+if(NOT _GPU_CC_NUM)
+    message(FATAL_ERROR "无法检测 GPU 架构，请确认 nvidia-smi 可用")
+endif()
+
+# ── find_package(Torch) 前的准备：TORCH_CUDA_ARCH_LIST + unset ───────────────
+#
+# 顺序约束（三者缺一不可）：
+#   1. execute_process(nvidia-smi) 先于此处运行，_GPU_CC 已有值（如 "8.6"）
+#   2. TORCH_CUDA_ARCH_LIST 在 find_package(Torch) 之前设置，供 PyTorch cmake 读取
+#   3. unset(CMAKE_CUDA_ARCHITECTURES CACHE) 在 find_package(Torch) 之前清除，
+#      避免 PyTorch cuda.cmake 第 322 行 if(DEFINED CMAKE_CUDA_ARCHITECTURES) 触发 Warning 2
+#      根因：project(... LANGUAGES CUDA) 初始化 CUDA 语言时，CMake 3.20（CMP0104）
+#            会自动将 CMAKE_CUDA_ARCHITECTURES 赋为默认值（"native" 或空串）；
+#            不 unset 则 find_package(Torch) 执行时变量已定义，Warning 2 触发
+#   4. set(CMAKE_CUDA_ARCHITECTURES) 在 find_package(Torch) 之后、check_language(CUDA)
+#      之前设置：check_language 编译测试程序时需要 CMAKE_CUDA_ARCHITECTURES 有值，
+#      若为空则报 "CUDA_ARCHITECTURES is empty for target" 错误
+#
+#   TORCH_CUDA_ARCH_LIST 格式：带点版本号 "8.6"（PyTorch 专用）
+#   CMAKE_CUDA_ARCHITECTURES 格式：无点整数 "86"（CMake / nvcc 专用）
 set(TORCH_CUDA_ARCH_LIST "${_GPU_CC}")
-
+unset(CMAKE_CUDA_ARCHITECTURES CACHE)
 # find_package(Torch REQUIRED)：查找 LibTorch（PyTorch 的 C++ 后端）
 #   设置以下变量：
 #     TORCH_INCLUDE_DIRS   : torch/extension.h 等头文件路径
@@ -79,17 +123,31 @@ find_package(Torch REQUIRED)
 #     影响：无，NVRTC 是运行时编译库，本项目不使用，可忽略
 #
 #   Warning 2：pytorch is not compatible with CMAKE_CUDA_ARCHITECTURES
-#     来源：cuda.cmake 第 322 行 if(DEFINED CMAKE_CUDA_ARCHITECTURES)
-#     原因：CMAKE_CUDA_ARCHITECTURES 在 find_package(Torch) 执行时已定义，
-#           PyTorch cmake 检测到后发出警告并强制 set(CMAKE_CUDA_ARCHITECTURES OFF)
-#     修复：将 CMAKE_CUDA_ARCHITECTURES 移到 find_package(Torch) 之后设置，
-#           PyTorch cmake 运行时变量尚未定义，if(DEFINED ...) 为假，Warning 不触发
-#           TORCH_CUDA_ARCH_LIST 设在此前是为了让 PyTorch 用正确架构，与消除 Warning 无关
+#     见上方顺序约束说明，已通过 unset + 延迟 set 修复
 #
 #   Warning 3：static library kineto_LIBRARY-NOTFOUND not found
 #     来源：TorchConfig.cmake，Kineto 是 PyTorch 的性能分析库
 #     原因：此 PyTorch 安装包未编译 Kineto，find_library 找不到
 #     影响：无，Kineto 仅用于 PyTorch 自身的性能分析，不影响 CUDA kernel 编译和运行，可忽略
+
+# set(CMAKE_CUDA_ARCHITECTURES)：find_package(Torch) 之后、check_language(CUDA) 之前设置
+
+# set(CMAKE_CUDA_ARCHITECTURES <架构号>)：全局设置目标 GPU 的计算能力版本
+#   触发 Warning 并强制将其覆盖为 OFF（见上方 TORCH_CUDA_ARCH_LIST 注释）
+#
+#   作用范围：对之后所有 add_library / add_executable 创建的 target 全局生效，
+#             各 target 自动继承，无需逐个调用 set_target_properties(... CUDA_ARCHITECTURES ...)
+#   CMake 内部将其展开为 nvcc 的 -gencode 标志：
+#     -gencode arch=compute_86,code=[sm_86,compute_86]
+#       code=sm_86      : 生成 SASS 二进制，在当前 GPU 上直接执行，性能最优
+#       code=compute_86 : 保留 PTX 中间码，供未来更新架构的 GPU JIT 编译（向前兼容）
+#   常见架构号对照：
+#     75=Turing(RTX20)  80=Ampere(A100)  86=Ampere(RTX30)  89=Ada(RTX40)  90=Hopper(H100)
+#   不设置全局值时的替代方式（效果相同，但需逐个 target 指定，繁琐）：
+#     set_target_properties(softmax_cuda PROPERTIES CUDA_ARCHITECTURES 86)
+#     cmake -DCMAKE_CUDA_ARCHITECTURES=86 ...
+set(CMAKE_CUDA_ARCHITECTURES ${_GPU_CC_NUM})
+message(STATUS "GPU Compute Capability: ${_GPU_CC} -> CMAKE_CUDA_ARCHITECTURES=${_GPU_CC_NUM}  TORCH_CUDA_ARCH_LIST=${_GPU_CC}")
 
 # find_library(<变量名> <库名> [PATHS <路径>] [REQUIRED])
 #   与 find_package 的区别：
@@ -122,14 +180,10 @@ include(CheckLanguage)
 
 # check_language(CUDA)：探测当前系统是否具备完整可用的 CUDA 编译环境
 #   实际编译一段最小 CUDA 代码来验证 nvcc 能否正常工作
+#   需要 CMAKE_CUDA_ARCHITECTURES 已设置（见上方），否则报 "CUDA_ARCHITECTURES is empty" 错误
 #   结果写入缓存变量 CMAKE_CUDA_COMPILER：
 #     有效路径（如 /usr/local/cuda/bin/nvcc）：探测成功
 #     NOTFOUND                               ：探测失败
-#
-#   与 project() 阶段的关系：
-#     project(... LANGUAGES CXX CUDA) 已经探测并启用了 CUDA 编译器，
-#     此处 check_language 是额外的防御性验证，确保 nvcc 真正可用，
-#     若不可用则主动 FATAL_ERROR，给出明确报错而非让后续编译命令失败时报出难以定位的错误
 check_language(CUDA)
 if(NOT CMAKE_CUDA_COMPILER)
     message(FATAL_ERROR "CUDA compiler not found")
@@ -143,61 +197,6 @@ set(CMAKE_CXX_STANDARD 20)
 #   不设置（默认）：编译器不支持时悄悄降级（如降到 C++17），你以为在用 C++20 实际没有
 #   设置为 ON    ：不支持则 fatal error，确保编译标志确实是 -std=c++20
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# execute_process(<参数列表>)：在 cmake 配置阶段（而非编译阶段）运行外部命令
-#   与 add_custom_command 的区别：
-#     execute_process   : cmake -S ... -B ... 时立即执行，结果作为配置信息使用
-#     add_custom_command: make / ninja 时执行，属于构建阶段的步骤
-#
-#   COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-#     nvidia-smi        : NVIDIA 系统管理接口，随 GPU 驱动安装，与 CUDA Toolkit 无关
-#     --query-gpu=compute_cap : 查询 GPU 的 Compute Capability，输出格式为 "8.6"
-#     --format=csv,noheader   : 以 CSV 格式输出，去掉表头行，只保留数值
-#     多卡机器每张卡输出一行，此处取第一行（_GPU_CC 只读第一个值）
-#
-#   OUTPUT_VARIABLE _GPU_CC          : 将命令的 stdout 存入变量 _GPU_CC（值为 "8.6"）
-#   OUTPUT_STRIP_TRAILING_WHITESPACE : 去掉末尾换行符，否则 _GPU_CC 为 "8.6\n"，
-#                                      后续 string(REPLACE) 和比较操作会出错
-#   ERROR_QUIET                      : nvidia-smi 不存在时静默失败，不打印错误到终端，
-#                                      不中断 cmake 配置；_GPU_CC 保持为空，
-#                                      由下方 if(NOT _GPU_CC_NUM) 统一报错
-execute_process(
-    COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
-    OUTPUT_VARIABLE _GPU_CC
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    ERROR_QUIET
-)
-
-# string(REPLACE <匹配串> <替换串> <结果变量> <输入串>)
-#   将 _GPU_CC（"8.6"）中的 "." 替换为 ""，得到 "86" 存入 _GPU_CC_NUM
-#   nvcc 的 -gencode 参数需要无小数点的整数形式（如 86），不接受 "8.6"
-string(REPLACE "." "" _GPU_CC_NUM "${_GPU_CC}")
-
-# if(NOT _GPU_CC_NUM)：变量为空字符串或未定义时条件为真
-#   两种情况会走到这里：
-#     1. nvidia-smi 不存在（ERROR_QUIET 静默，_GPU_CC 为空，_GPU_CC_NUM 也为空）
-#     2. nvidia-smi 存在但输出异常（如权限问题），导致 _GPU_CC 为空
-if(NOT _GPU_CC_NUM)
-    message(FATAL_ERROR "无法检测 GPU 架构，请确认 nvidia-smi 可用")
-endif()
-
-# set(CMAKE_CUDA_ARCHITECTURES <架构号>)：全局设置目标 GPU 的计算能力版本
-#   必须在 find_package(Torch) 之后设置，否则 PyTorch 的 cuda.cmake 检测到该变量已定义，
-#   触发 Warning 并强制将其覆盖为 OFF（见上方 TORCH_CUDA_ARCH_LIST 注释）
-#
-#   作用范围：对之后所有 add_library / add_executable 创建的 target 全局生效，
-#             各 target 自动继承，无需逐个调用 set_target_properties(... CUDA_ARCHITECTURES ...)
-#   CMake 内部将其展开为 nvcc 的 -gencode 标志：
-#     -gencode arch=compute_86,code=[sm_86,compute_86]
-#       code=sm_86      : 生成 SASS 二进制，在当前 GPU 上直接执行，性能最优
-#       code=compute_86 : 保留 PTX 中间码，供未来更新架构的 GPU JIT 编译（向前兼容）
-#   常见架构号对照：
-#     75=Turing(RTX20)  80=Ampere(A100)  86=Ampere(RTX30)  89=Ada(RTX40)  90=Hopper(H100)
-#   不设置全局值时的替代方式（效果相同，但需逐个 target 指定，繁琐）：
-#     set_target_properties(softmax_cuda PROPERTIES CUDA_ARCHITECTURES 86)
-#     cmake -DCMAKE_CUDA_ARCHITECTURES=86 ...
-set(CMAKE_CUDA_ARCHITECTURES ${_GPU_CC_NUM})
-message(STATUS "GPU Compute Capability: ${_GPU_CC} -> CMAKE_CUDA_ARCHITECTURES=${_GPU_CC_NUM}  TORCH_CUDA_ARCH_LIST=${_GPU_CC}")
 
 # ── 可配置的 kernel 编译参数 ──────────────────────────────────────────────────
 # set(<变量名> <默认值> CACHE <类型> "<描述>")
@@ -348,11 +347,33 @@ add_compile_options(${TORCH_CXX_FLAGS_LIST})
 #     add_library SHARED → ld 生成无入口的共享库（ET_DYN，无 main）
 #     add_executable     → ld 生成有入口的可执行文件（ET_EXEC / ET_DYN，有 main）
 #
+# aux_source_directory(<目录> <变量>)：扫描指定目录下所有已知扩展名的源文件（.c/.cpp/.cu 等），
+#   将完整路径列表存入变量，非递归（不扫子目录）
+#   等价于手动写：set(KERNELS src/kernels/softmax_kernel.cu ...)
+#   缺点：新增文件后需手动 Reload CMake 才能被感知（配置阶段执行一次，之后不追踪变化）
+aux_source_directory(${PROJECT_SOURCE_DIR}/src/kernels KERNELS)
+
 # ── softmax_cuda 共享库（Python 扩展模块）────────────────────────────────────
 # 构建为 SHARED 库而非可执行文件，Python import 时动态加载 .so
-#   interface.cpp : pybind11 模块定义（PYBIND11_MODULE + torch::Tensor 绑定）
-#   kernels.cu    : 所有 softmax_kernelN 的 CUDA 实现
-add_library(softmax_cuda SHARED src/interface.cpp src/kernels.cu)
+#
+# CMake 根据每个源文件的扩展名决定编译器，各文件独立编译为 .o，最后链接为 .so：
+#   .cpp → g++   src/interface.cpp             → interface.cpp.o
+#   .cu  → nvcc  src/kernels.cu                → kernels.cu.o
+#   .cu  → nvcc  src/kernels/softmax_kernel.cu → softmax_kernel.cu.o
+#                     ↓ ld（链接）
+#   softmax_cuda.cpython-313-x86_64-linux-gnu.so
+#     ├── interface.cpp.o
+#     ├── kernels.cu.o
+#     └── softmax_kernel.cu.o
+#
+# 增量编译：只有内容变化的源文件重新走编译流程，其余复用已有 .o
+#   修改 kernels.cu → 只重编 kernels.cu.o，interface.cpp.o / softmax_kernel.cu.o 不变
+add_library(softmax_cuda SHARED
+    src/interface.cpp
+    src/kernels.cuh
+    src/run_kernels.cu
+    ${KERNELS}
+)
 
 # Python C 扩展的文件命名规范：
 #   Python 解释器 import 时按固定规则搜索文件名，格式为：
@@ -407,8 +428,17 @@ endif()
 #   即：target_compile_definitions 本身在配置阶段执行（写 build.ninja），
 #       对 kernels.cu 的实际影响发生在编译阶段的预处理器步骤，两者不在同一阶段
 #
+#   作用范围：对 softmax_cuda 的所有源文件生效（add_library 列出的每个文件）
+#     g++  src/interface.cpp             ... -DTORCH_EXTENSION_NAME=softmax_cuda -DBLOCK_DIM_Y=1024 ...
+#     nvcc src/kernels.cu                ... -DTORCH_EXTENSION_NAME=softmax_cuda -DBLOCK_DIM_Y=1024 ...
+#     nvcc src/kernels/softmax_kernel.cu ... -DTORCH_EXTENSION_NAME=softmax_cuda -DBLOCK_DIM_Y=1024 ...
+#   各文件实际用到的宏：
+#     interface.cpp             : 只用 TORCH_EXTENSION_NAME（PYBIND11_MODULE 展开时用）
+#     kernels.cu                : 用 BLOCK_DIM_Y / UNROLL_FACTOR / SOFTMAX_VARIANT / WIDTH
+#     kernels/softmax_kernel.cu : 同 kernels.cu，多余的宏传入后编译器忽略未使用的定义
+#
 #   与 add_compile_options 的区别：
-#     add_compile_options     : 对所有 target 全局生效
+#     add_compile_options        : 对所有 target 全局生效
 #     target_compile_definitions : 只对指定 target（softmax_cuda）生效，不影响其他 target
 #
 #   PRIVATE：宏定义只作用于 softmax_cuda 自身的编译
@@ -446,9 +476,12 @@ target_compile_definitions(softmax_cuda PRIVATE
 # 头文件搜索路径
 #   CUDAToolkit_INCLUDE_DIRS : /usr/local/cuda/include（cuda_runtime.h 等）
 #   TORCH_INCLUDE_DIRS       : torch/extension.h / torch/torch.h / pybind11 头文件
+#   Python3_INCLUDE_DIRS     : Python.h，由 find_package(Python3 ... Development) 提供
+#                              torch/extension.h → python_headers.h → <Python.h> 所需
 target_include_directories(softmax_cuda PRIVATE
     ${CUDAToolkit_INCLUDE_DIRS}
     ${TORCH_INCLUDE_DIRS}
+    ${Python3_INCLUDE_DIRS}
 )
 
 # 链接库
