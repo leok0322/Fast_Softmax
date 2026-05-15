@@ -226,16 +226,37 @@ empty_like 的语义：
       size_t   nbytes_;     // 分配的总字节数（= numel × sizeof(dtype)）
       Device   device_;     // 内存所在设备（CPU / CUDA:0 等）
 
+      // ── Storage 的类型擦除 ──────────────────────────────────────────────────
+      // Storage 创建时 dtype 只用于计算 nbytes，之后被"擦除"：
+      //   nbytes_ = numel × sizeof(float)   // dtype=float → ×4
+      //   cudaMalloc(&data_ptr_, nbytes_)   // 返回 void*，没有类型，只是一块内存
+      //
+      // 类型信息存放在两处：
+      //   TensorImpl::dtype_（运行时值）：记录"这块内存里装的是 float"，
+      //     可做运行时检查，但编译器不认识它，无法用它生成类型化指针
+      //   data_ptr<T>() 的模板参数 T（编译期类型）：调用方显式指定，
+      //     static_cast<T*> 完成"类型复活"，编译器不做运行时检查，信任调用方
+      //
+      // 创建时 dtype 与 data_ptr<T>() 的 T 必须一致，否则：
+      //   PyTorch 真实实现：TORCH_CHECK(dtype() == TypeMeta::Make<T>(), ...) 抛异常
+      //   本简化版本：static_cast 静默成功，但读出的是垃圾值（内存被错误解读）
+      //     例：float 数据 [1.0f, 2.0f] 用 data_ptr<double>() 读取：
+      //       实际内存：[00 00 80 3F][00 00 00 40]  ← 两个 float，各 4 字节
+      //       double 解读：[00 00 80 3F 00 00 00 40] ← 8 字节合并为一个 double → 垃圾值
+      //
+      // AT_DISPATCH_FLOATING_TYPES 保证 T 与实际 dtype 一致：
+      //   运行时判断 x.scalar_type() == Float → case Float → using scalar_t = float
+      //   → x.data_ptr<float>()：T = float，与创建时 dtype 一致，安全
+
       // data()：返回 data_ptr_ 的值（void*）
       //   是 Storage 的唯一对外接口，调用方拿到 void* 后再 static_cast<T*> 使用
       //   const noexcept：不修改 Storage 的任何字段，不抛出异常
-      //   等价于直接访问 data_ptr_，封装的目的是隐藏字段名、便于子类重写
       void* data() const noexcept { return data_ptr_; }
 
       // 调用链：
       //   x.data_ptr<float>()
       //     → impl_->storage_.data()     // Storage::data()，返回 void*
-      //       → static_cast<float*>(...)  // data_ptr<T>() 内的强转
+      //       → static_cast<float*>(...)  // data_ptr<T>() 内的强转，T=float
       //         → float* 指向 GPU 显存首地址，传给 CUDA kernel
   };
 
