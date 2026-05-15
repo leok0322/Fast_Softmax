@@ -314,6 +314,16 @@ empty_like 的语义：
       }
 
       // 维度数
+      // 返回类型 int64_t，不用 int：
+      //   int 的位宽由平台决定，C++ 标准只保证 >= 16 位，64位系统上通常是 32 位
+      //   int64_t 定义在 <cstdint>，保证在任何平台上精确为 64 位
+      //   int 范围 ~21 亿，int64_t 范围 ~9.2×10¹⁸
+      //   张量形状（sizes_/strides_）全部用 int64_t，dim()/size()/numel() 返回
+      //   同类型，避免混用导致的隐式转换警告或溢出
+      //
+      //   int dim = x.dim();    // 拿到"这个张量有几维"，如 2D→2, 3D→3
+      //   x.size(0)             // 第0维的元素数，等价于 Python x.shape[0]
+      //   x.numel()             // 所有元素总数 = shape[0]*shape[1]*...
       int64_t dim() const {
           return static_cast<int64_t>(impl_->sizes_.size());
       }

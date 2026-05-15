@@ -615,8 +615,10 @@ set_target_properties(softmax_cuda PROPERTIES
 #                                                                                     #   本项目 kernels.cu 编译慢，只改 interface.cpp 时
 #                                                                                     #   Ninja 能更快识别并只重编该文件，减少等待
 #                                                                                     #   两者最终产物完全相同，cmake --build 对两者通用
-#       -S /home/liam/cpp_linux/Fast_Softmax \                                       # 源码目录（CMakeLists.txt 所在位置）
-#       -B /home/liam/cpp_linux/Fast_Softmax/cmake-build-release                     # 构建目录（build.ninja / .o / .so 的输出位置）
+#       -S /home/liam/cpp_linux/Fast_Softmax \                                       # 源码目录：CMake 从这里读取 CMakeLists.txt
+#                                                                                     #   -S 是 CMake 3.13 引入的显式标志；早期惯用 cd build && cmake ..
+#                                                                                     #   用相对路径 .. 隐式指向源码目录，-S 让路径一目了然，无需 cd
+#       -B /home/liam/cpp_linux/Fast_Softmax/cmake-build-release                     # 构建目录：build.ninja / CMakeCache.txt / .o / .so 均输出到此
 #
 #   CLion 中等价配置（Settings → Build, Execution, Deployment → CMake → CMake options）：
 #     -DCMAKE_PREFIX_PATH=/home/liam/python_linux/python_venv/.venv/lib/python3.13/site-packages/torch/share/cmake
