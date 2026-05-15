@@ -723,8 +723,14 @@ CMakeLists.txt 完整解析
       -DWIDTH=0 \
       -DCMAKE_MAKE_PROGRAM=/usr/bin/ninja \
       -G Ninja \
-      -S /home/liam/cpp_linux/Fast_Softmax \
-      -B /home/liam/cpp_linux/Fast_Softmax/cmake-build-release
+      -S /home/liam/cpp_linux/Fast_Softmax \       # 源码目录：CMake 从这里读取 CMakeLists.txt
+      -B /home/liam/cpp_linux/Fast_Softmax/cmake-build-release  # 构建目录：build.ninja / .o / .so 输出到此
+
+  -S / -B 说明：
+    -S 是 CMake 3.13 引入的显式源码目录标志
+    早期惯用写法：cd build && cmake ..（用相对路径 .. 隐式指向源码目录，需先 cd）
+    -S / -B 无需 cd，路径一目了然，现代写法推荐用这两个标志
+    -S . 等价于 -S /当前目录（. 表示当前工作目录）
 
   -G Ninja 的优势：
     Make  : 每次构建递归扫描完整依赖树再决定重建目标，启动开销大
