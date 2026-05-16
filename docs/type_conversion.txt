@@ -158,3 +158,65 @@ C++ 类型转换
   本项目中的典型用法：
     static_cast<T*>(storage_.data())   // void* → T*，data_ptr<T>() 内部实现
     static_cast<int64_t>(sizes_.size()) // size_t → int64_t，dim() 返回值转换
+
+
+七、static_cast 必须使用的场景
+================================================================================
+
+  数值类型互转有隐式转换，static_cast 可选（消警告）；
+  以下两种情况没有隐式转换，不写就报错：
+
+  【1. void* → T*（必须显式，反方向不需要）】
+
+    void* v = ...;
+    float* p = static_cast<float*>(v);  // ✓ 必须写，程序员承诺类型正确
+    float* p = v;                        // ❌ 编译报错，C++ 禁止隐式转换
+
+    反方向（float* → void*）是隐式的，直接赋值即可：
+    void* v = p;                         // ✓ 任何指针都可隐式转为 void*
+
+    原因：void* 是"通用指针"，语言专门定义了从任意指针隐式转为 void* 的规则，
+          但反过来编译器不知道 void* 里存的是什么类型，必须程序员显式声明。
+
+  【2. enum class → int（enum class 刻意禁止隐式转换）】
+
+    enum class Color { Red = 0, Green = 1 };
+    int i = Color::Green;                        // ❌ 编译报错
+    int i = static_cast<int>(Color::Green);      // ✓ 必须显式
+
+    普通 enum（不加 class）可以隐式转为 int，enum class 是 C++11 引入的强类型枚举，
+    故意禁止隐式转换以避免误用。
+
+
+八、reinterpret_cast 必须使用的场景
+================================================================================
+
+  用于语言没有定义转换关系的情况，强制重新解释内存位模式，编译器不做任何检查。
+
+  【1. 无关联的指针类型之间（如 T** → void**）】
+
+    float** pp = ...;
+    void** vv = reinterpret_cast<void**>(pp);  // ✓ 必须用 reinterpret_cast
+    void** vv = static_cast<void**>(pp);        // ❌ 编译报错，无关联类型
+
+    与 void* 的区别：
+      void*  是一级指针，语言专门为它定义了转换规则（见七-1）
+      void** 是"指向 void* 的指针"，没有任何特殊待遇，与 float** 完全无关联
+
+    本项目场景：cudaMalloc(void** devPtr, size_t size)，dA 是 float*：
+      cudaMalloc(reinterpret_cast<void**>(&dA), size)  // &dA 是 float**，强制转 void**
+
+  【2. 指针 ↔ 整数之间】
+
+    uintptr_t addr = reinterpret_cast<uintptr_t>(ptr);  // 指针 → 整数（存地址值）
+    float* p = reinterpret_cast<float*>(addr);           // 整数 → 指针（恢复指针）
+
+  ┌─────────────────────────┬──────────────────┬────────────────────────────────┐
+  │ 转换场景                │ 用哪个           │ 原因                           │
+  ├─────────────────────────┼──────────────────┼────────────────────────────────┤
+  │ 数值类型互转            │ 可选 static_cast │ 有隐式转换，cast 只为消警告    │
+  │ void* → T*              │ 必须 static_cast │ 无隐式转换，static_cast 允许   │
+  │ enum class → int        │ 必须 static_cast │ enum class 禁止隐式转换        │
+  │ T** → void**            │ 必须 reinterpret │ 无关联类型，static_cast 拒绝   │
+  │ 指针 ↔ 整数             │ 必须 reinterpret │ 无语言定义的转换关系           │
+  └─────────────────────────┴──────────────────┴────────────────────────────────┘
