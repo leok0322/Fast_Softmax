@@ -62,6 +62,38 @@ __global__ void softmax_kernel_2(scalar_t* __restrict__ a, scalar_t* __restrict_
   }
 }
 
+
+
+
+// ─── 为什么用树形规约能提高 GFLOPS ───────────────────────────────────────────
+//
+// GFLOPS = 浮点运算次数 / 执行时间。
+// 总操作数固定（7n × m），要提高 GFLOPS 只能缩短执行时间。
+//
+// 【串行规约的瓶颈】
+//   若用单线程对一行 n 个元素求 max / sum：
+//     时间 ∝ n（顺序依赖，无法并行）
+//   其余 k-1 个线程全部空闲，SM 的算力和内存带宽严重浪费。
+//   空闲线程 → warp 占用率低 → 无法用其他 warp 的指令掩盖内存延迟（latency hiding 失效）。
+//
+// 【树形规约的改进】
+//   Step 1  串行阶段：k 个线程各自负责 n/k 列，并行执行，时间 ∝ n/k。
+//   Step 2  规约阶段：log₂(k) 轮，每轮活跃线程减半，时间 ∝ log₂(k)。
+//   总时间 ∝ n/k + log₂(k)，远小于串行的 n。
+//
+//   示例（k = BLOCK_DIM_X = 1024，n = 4096）：
+//     串行时间 ∝ 4096
+//     树形时间 ∝ 4096/1024 + log₂(1024) = 4 + 10 = 14   → 约 293× 加速
+//
+// 【附带收益】
+//   · k 个线程并发发出内存请求 → 更充分利用 HBM/L2 带宽。
+//   · 更多活跃 warp → scheduler 可在内存延迟期间切换执行其他 warp（latency hiding）。
+//
+// 【代价】
+//   · 需要 shared memory（BLOCK_DIM_X × 4 字节）存储各线程的中间结果。
+//   · 每轮规约需要 __syncthreads()，引入同步开销（共 log₂(k) 次）。
+//   · 当 n ≪ k 时，大量线程空转，规约收益下降。
+// ─────────────────────────────────────────────────────────────────────────────
 template <typename scalar_t,typename scalar_i>
 __global__ void softmax_kernel_reduction(scalar_t* __restrict__ a, scalar_t* __restrict__ b, scalar_i totalRow, scalar_i totalCol) {
   // 该block负责的启始行
