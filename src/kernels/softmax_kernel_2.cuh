@@ -122,16 +122,76 @@ __global__ void softmax_kernel_reduction(scalar_t* __restrict__ a, scalar_t* __r
     // 修复：原为 i 从 1 开始且不依赖 colGroup，导致所有线程计算相同元素、遗漏元素 [0]
     // 正确：从 colGroup 开始步长 threadNum，每线程覆盖自己的列组
     for (scalar_i i {colGroup}; i < totalCol; i+=threadNum) {
+      // 1个warp32个线程，每个线程访问a中的一个浮点数元素，32个线程访问的浮点数元素连续，32 * 4 Bytes = 128 Bytes
+
+      // ── 全局内存访问流程 ────────────────────────────────────────────────────
+      // warp 内 32 线程同时执行，colGroup 连续（0,1,2,...,31），读取地址连续：
+      //   thread 0 → a[base + 0]
+      //   thread 1 → a[base + 1]
+      //   ...
+      //   thread 31→ a[base + 31]   （base = (row+initRow)*totalCol + i_offset）
+      //
+      // L1 miss 路径：
+      //   32线程 × 4字节 = 128字节，落入 4 个连续 sector（各32字节）
+      //   → 向 L2 发出 4 次 sector 事务（各32字节），填满 L1 中 1 条 cache line
+      //
+      // L1 hit 路径（同一行被后续 pass 再次访问时）：
+      //   L1 以 sector 为单位定位数据，4 个 sector 直接送给 warp，不访问 L2/DRAM
+      //
+      // L2 miss 路径（L1 miss 且 L2 也未命中）：
+      //   L2 以 cache line（128字节）为单位向 DRAM 发起请求
+      //   DRAM 按 sector（32字节）粒度传输，共 4 次 DRAM 事务
+      //   → 4 个 sector 填入 L2 cache line，再由 L2 送往 L1
+      //
+      // ── 128字节对齐要求 ─────────────────────────────────────────────────────
+      // 32字节对齐 → sector 事务数最优（4次），是 coalescing 的充分条件。
+      // 128字节对齐 → 额外保证 128字节数据不跨 cache line 边界：
+      //   若跨边界（如起始于 byte 32）：数据落入 2 条 cache line，
+      //   L2 cold miss 时须向 DRAM 取 2×128=256字节，其中 128字节无用 → 带宽浪费50%。
+      //   若128字节对齐：数据完整在 1 条 cache line 内，DRAM 仅取 128字节，利用率100%。
+      //
+      // 本代码满足128字节对齐：
+      //   行首地址 = 基址 a + 行首偏移
+      //
+      //   ① 基址 a：cudaMalloc 保证256字节对齐，即 a % 256 == 0，自然满足 a % 128 == 0
+      //
+      //   ② 行首偏移 = (row + initRow) × totalCol × sizeof(float)
+      //              = (row + initRow) × totalCol × 4  字节
+      //
+      //     要使偏移是128的整数倍，需要 totalCol × 4 是128的整数倍：
+      //       totalCol × 4 % 128 == 0
+      //       → totalCol % 32 == 0   （128 / 4 = 32）
+      //
+      //     totalCol = 1024 → 1024 × 4 = 4096 =  32 × 128 ✓
+      //     totalCol = 2048 → 2048 × 4 = 8192 =  64 × 128 ✓
+      //     totalCol = 4096 → 4096 × 4 = 16384 = 128 × 128 ✓
+      //
+      //     2的幂次且 ≥ 32 均满足，(row+initRow) 取任意整数，偏移始终是128的整数倍
+      //
+      //   ③ 行首地址 = (128的整数倍) + (128的整数倍) = 128字节对齐 ✓
       maxval = fmax(maxval, a[(row + initRow) * totalCol + i]);
     }
+    //  shared memory 有 32 个 bank，每个 bank 宽 4 字节
+    // float 数组元素 reduction[k] 落在 bank = k % 32。
+    // 1个warp32个线程，colGroup = threadIdx.x，连续取值（如 0..31、32..63 等）
+    //  每个 warp 内 32 个线程各访问一个 bank，32 个 bank 恰好全部覆盖且无重复 → 无 bank conflict ✓
     reduction[colGroup] = maxval;
     // 同步
     __syncthreads();
 
-    // 线程进行树形规约求最大值
+    // 线程进行树形规约求最大值，
     for (scalar_i i {threadNum/2}; i>=1; i/=2) {
       // 每次循环用到的线程减半
       if (colGroup < i) {
+        // threadNum = 1024
+        // i 依次为 512, 256, 128, 64, 32（均是 32 的倍数）
+        // reduction[colGroup+i] → bank = (colGroup + i) % 32 = colGroup % 32
+        // 同一 warp 内 colGroup 连续 → bank 仍各不同 ✓
+
+        // i = 16, 8, 4, 2, 1（活跃线程数 < 32，只有半个 warp 或更少）：
+        // Bank conflict 以单条指令为单位判定：同一条指令内同一 warp 的多个线程访问同一 bank 才冲突。Load A、Load B、Store 三条指令分别判定，每条指令内活跃线程访问的 bank 各不相同，所以三条指令均无 conflict。
+        // 因为reduction[colGroup]、reduction[colGroup+i]是两个指令
+        // 一个warp32个线程 colGroup 连续 → bank 仍各不同 ✓
         reduction[colGroup] = fmaxf(reduction[colGroup], reduction[colGroup+i]);
       }
       __syncthreads();
@@ -142,6 +202,7 @@ __global__ void softmax_kernel_reduction(scalar_t* __restrict__ a, scalar_t* __r
     // 线程进行树形规约求和
     // 先存储colGroup列的值
     for (scalar_i col {colGroup}; col < totalCol; col+=threadNum) {
+      // 1个warp32个线程合并访问事务
       sum += __expf(a[(row + initRow) * totalCol + col] - maxval);
     }
     // Bug 3（非 bug）：blockDim.y=1 → threadIdx.y 恒为 0 → 块内只有 threadIdx.x（colGroup）变化
@@ -157,6 +218,9 @@ __global__ void softmax_kernel_reduction(scalar_t* __restrict__ a, scalar_t* __r
         // Bug 2（已修复）：原代码在求和树形规约中读 a[] 而非 reduction[]
         // 读 a[] 只能取单个原始值，导致其他线程已累积的部分和全部丢失
         // 修复：读 reduction[colGroup+i]，合并右侧线程已累积的部分和
+
+        // 1个warp32个线程三个指令（load reduction[colGroup]、load reduction[colGroup+i]、store reduction[colGroup]）无bank conflict
+        //  i ≥ 32 时 warp 内全部 32 线程活跃；i < 32 时只有 i 个线程活跃，不总是 32 个
         reduction[colGroup] += reduction[colGroup + i];
       }
       __syncthreads();
@@ -168,6 +232,7 @@ __global__ void softmax_kernel_reduction(scalar_t* __restrict__ a, scalar_t* __r
     // 修复：原为 i 从 0 开始，所有线程写相同位置（0, threadNum, 2*threadNum...），大量列未写入
     // 正确：从 colGroup 开始，每线程写自己负责的列组
     for (scalar_i i {colGroup}; i < totalCol; i+=threadNum) {
+      // 1个warp32个线程访问a和b，内存连续，合并访问事务
       b[(row + initRow) * totalCol + i] = __expf(a[(row + initRow) * totalCol + i] - maxval) / diversor;
     }
   }
