@@ -8,4 +8,4 @@ void run_softmax_kernel_base(uint totalRow, uint totalCol, float* A, float* out)
 
 void run_softmax_kernel_naive(uint M, uint totalCol, float* A, float* out);
 
-void run_softmax_kernel_reduction(uint totalRow, uint totalCol, float* A, float* out);
+void run_softmax_kernel_tree_reduction(uint totalRow, uint totalCol, float* A, float* out);

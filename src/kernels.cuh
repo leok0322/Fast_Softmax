@@ -1,7 +1,7 @@
 #pragma once
 
 #include "kernels/softmax_kernel.cuh"
-#include "kernels/softmax_kernel_2.cuh"
+#include "kernels/softmax_kernel_2_SMEM_tree_reduction.cuh"
 #include "kernels/softmax_kernel_3.cuh"
 #include "kernels/softmax_kernel_4.cuh"
 #include "kernels/softmax_kernel_5.cuh"

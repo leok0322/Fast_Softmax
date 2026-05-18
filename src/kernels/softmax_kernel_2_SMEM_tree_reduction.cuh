@@ -95,7 +95,7 @@ __global__ void softmax_kernel_2(scalar_t* __restrict__ a, scalar_t* __restrict_
 //   · 当 n ≪ k 时，大量线程空转，规约收益下降。
 // ─────────────────────────────────────────────────────────────────────────────
 template <typename scalar_t,typename scalar_i>
-__global__ void softmax_kernel_reduction(scalar_t* __restrict__ a, scalar_t* __restrict__ b, scalar_i totalRow, scalar_i totalCol) {
+__global__ void softmax_kernel_tree_reduction(scalar_t* __restrict__ a, scalar_t* __restrict__ b, scalar_i totalRow, scalar_i totalCol) {
   // 该block负责的启始行
   scalar_i initRow = blockIdx.y * blockDim.y;
   // 该线程的起始行

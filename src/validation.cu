@@ -74,7 +74,7 @@ void run_kernel(int kernel_num, uint totalRow, uint totalCol, float *A,
     switch (kernel_num) {
         case 0:  run_softmax_kernel_base(totalRow, totalCol, A, out);  break;
         case 1:  run_softmax_kernel_naive(totalRow, totalCol, A, out); break;
-        case 2:  run_softmax_kernel_reduction(totalRow, totalCol, A, out); break;
+        case 2:  run_softmax_kernel_tree_reduction(totalRow, totalCol, A, out); break;
         case 3:  break;
         case 4:  break;
         case 5:  break;

@@ -35,9 +35,9 @@ void run_softmax_kernel_naive(uint totalRow, uint totalCol, float* A, float* out
   cudaCheck(cudaGetLastError());
 }
 
-void run_softmax_kernel_reduction(uint totalRow, uint totalCol, float* A, float* out) {
+void run_softmax_kernel_tree_reduction(uint totalRow, uint totalCol, float* A, float* out) {
   dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
   dim3 grid_size = dim3(1, totalRow, 1);
-  softmax_kernel_reduction<float, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  softmax_kernel_tree_reduction<float, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }
