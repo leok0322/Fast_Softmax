@@ -33,14 +33,14 @@
 // __restrict__：
 //   告知编译器 a 和 b 指针不存在内存别名（不指向同一块内存）
 //   允许编译器跳过"写 b 是否影响读 a"的保守检查，生成更激进的访存优化代码
-template <typename scalar_t>
-__global__ void softmax_kernel_base(scalar_t* __restrict__ a, scalar_t* __restrict__ out, int64_t totalRow, int64_t totalCol)
+template <typename scalar_t, typename scalar_i>
+__global__ void softmax_kernel_base(scalar_t* __restrict__ a, scalar_t* __restrict__ out, scalar_i totalRow, scalar_i totalCol)
 {
   // col / rototalRow：当前线程负责的输出列号和行号
   //   blockIdx.x * blockDim.x + ttotalColreadIdx.x = (block列号)*32 + 线程列偏移
   //   blockIdx.y * blockDim.y + ttotalColreadIdx.y = (block行号)*32 + 线程行偏移
-  int64_t col = blockIdx.x * blockDim.x + threadIdx.x;
-  int64_t row = blockIdx.y * blockDim.y + threadIdx.y;
+  uint col = blockIdx.x * blockDim.x + threadIdx.x;
+  uint row = blockIdx.y * blockDim.y + threadIdx.y;
 
   // 边界检查：grid 按 totalRow/32, totalCol/32 整数除法划分（向下截断）
   //   若 totalRow 或 totalCol 不是 32 的倍数，边缘线程从未启动（欠覆盖），此处 if 只保护已启动线程不越界
@@ -77,26 +77,26 @@ __global__ void softmax_kernel_base(scalar_t* __restrict__ a, scalar_t* __restri
   // 后续 kernel2~10 通过线程协作 + stotalColared memory / totalRowarp stotalColuffle 将此降至 O(totalRow)
 }
 
-template <typename scalar_t>
-__global__ void softmax_kernel_naive(scalar_t* __restrict__ a, scalar_t* __restrict__ out, int64_t totalRow, int64_t totalCol) {
+template <typename scalar_t, typename scalar_i>
+__global__ void softmax_kernel_naive(scalar_t* __restrict__ a, scalar_t* __restrict__ out, scalar_i totalRow, scalar_i totalCol) {
 
   // 该block的起始行和列
-  int64_t initRow {blockIdx.y * blockDim.y};
-  int64_t initCol {blockIdx.x * blockDim.x};
+  uint initRow {blockIdx.y * blockDim.y};
+  uint initCol {blockIdx.x * blockDim.x};
 
   // 该线程负责的行和列
-  int64_t row {threadIdx.y};
-  int64_t col {threadIdx.x};
+  uint row {threadIdx.y};
+  uint col {threadIdx.x};
 
   //
   if ((initRow+row) < totalRow && (initCol+col) < totalCol) {
     scalar_t maxval = a[(initRow+row)*totalCol];
-    for (int64_t i = 1; i<totalCol; i++) {
+    for (uint i = 1; i<totalCol; i++) {
       maxval = fmaxf(maxval, a[(initRow+row)*totalCol + i]);
     }
 
     scalar_t divisor = 0.0f;
-    for (int64_t i = 0; i<totalCol; i++) {
+    for (uint i = 0; i<totalCol; i++) {
       divisor += __expf(a[(initRow+row)*totalCol + i] - maxval);
     }
 

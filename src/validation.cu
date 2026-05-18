@@ -23,7 +23,7 @@ const std::string resultDir  = "benchmark_results";
 // randomize_matrix：用随机浮点数填充矩阵，范围约 [-5, 5]
 //   以当前微秒时间戳作为随机种子，避免每次运行产生相同序列
 //   mat：CPU 内存指针；N：元素总数
-void randomize_matrix(float *mat, int N) {
+void randomize_matrix(float *mat, uint N) {
     timeval time {};
     gettimeofday(&time, nullptr);
     srand(time.tv_usec);
@@ -37,7 +37,7 @@ void randomize_matrix(float *mat, int N) {
 // verify_matrix：逐元素对比 kernel 输出（matOut）与参考结果（matRef）
 //   允许误差 0.01（浮点计算精度差异）
 //   发现误差超限或 NaN 时打印错误信息并返回 false
-bool verify_matrix(float *matRef, float *matOut, int N) {
+bool verify_matrix(float *matRef, float *matOut, uint64_t N) {
     double diff = 0.0;
     for (int i = 0; i < N; i++) {
         diff = std::fabs(matRef[i] - matOut[i]);
@@ -52,7 +52,7 @@ bool verify_matrix(float *matRef, float *matOut, int N) {
 
 // print_matrix：将矩阵内容以可读格式写入文件流，用于验证失败时记录输入/输出
 //   M×N 矩阵，每行 N 个元素，行间以 ";\n" 分隔，整体用 [] 包裹
-void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
+void print_matrix(const float *A, uint M, uint N, std::ofstream &fs) {
     fs << std::setprecision(2) << std::fixed;
     fs << "[";
     for (int i = 0; i < M * N; i++) {
@@ -69,12 +69,12 @@ void print_matrix(const float *A, int M, int N, std::ofstream &fs) {
 // run_kernel：按 kernel_num 分发到对应的 softmax kernel 实现
 //   参数默认值只需在头文件的函数声明中写，不在定义处重复
 //   deviceIdx：目标 GPU 设备编号（多卡时使用）
-void run_kernel(int kernel_num, int M, int N, float *A,
+void run_kernel(int kernel_num, uint M, uint N, float *A,
                 float *out, int deviceIdx) {
     switch (kernel_num) {
         case 0:  run_softmax_kernel_base(M, N, A, out);  break;
         case 1:  run_softmax_kernel_naive(M, N, A, out); break;
-        case 2:  break;
+        case 2:  run_softmax_kernel_reduction(M, N, A, out); break;
         case 3:  break;
         case 4:  break;
         case 5:  break;
@@ -126,8 +126,8 @@ int main(int argc, char **argv) {
 
     // ── 测试规模 ──────────────────────────────────────────────────────────────
     // 对每种 size，矩阵形状为 [size, size]，即 m = n = size
-    std::vector<int> SIZE = {128, 256, 512, 1024, 2048, 4096};
-    long m, n, max_size;
+    std::vector<uint> SIZE = {128, 256, 512, 1024, 2048, 4096};
+    uint m, n, max_size;
     max_size = SIZE[SIZE.size() - 1];   // 按最大规模分配内存，复用同一块缓冲区
     std::cout << "Max size: " << max_size << std::endl;
 
@@ -168,9 +168,9 @@ int main(int argc, char **argv) {
     cudaCheck(cudaMemcpy(dout_ref,out, sizeof(float) * max_size * max_size, cudaMemcpyHostToDevice));
 
     // ── 主测试循环 ────────────────────────────────────────────────────────────
-    int repeat_times = 50;   // 每个 size 重复 50 次取平均，减少 GPU 调度抖动影响
+    long repeat_times {50};   // 每个 size 重复 50 次取平均，减少 GPU 调度抖动影响
 
-    for (int size : SIZE) {
+    for (uint size : SIZE) {
         m = n = size;
         std::cout << "dimensions(m=n) " << m << std::endl;
 
@@ -189,7 +189,7 @@ int main(int argc, char **argv) {
             cudaCheck(cudaMemcpy(out_ref, dout_ref, sizeof(float) * m * n, cudaMemcpyDeviceToHost));
             cudaCheck(cudaMemcpy(out,     dout,     sizeof(float) * m * n, cudaMemcpyDeviceToHost));
 
-            if (!verify_matrix(out_ref, out, m * n)) {
+            if (!verify_matrix(out_ref, out, static_cast<uint64_t>(m) * n)) {
                 std::cout << "Failed to pass the correctness verification." << std::endl;
                 if (m <= 128) {
                     // 仅在小矩阵时记录完整数据，大矩阵文件过大
@@ -233,10 +233,10 @@ int main(int argc, char **argv) {
         //   Pass3（归一化）: n 次 exp + n 次除法 = 2n，+ 常数 3
         //   共 (n + 2n + 3) 次，m 行，每个输出元素 n 个操作 → ×n（此处按元素级估算）
         long floatPointOperations = (n + 2 * n + 3) * m * n;
-        double flops = (repeat_times * floatPointOperations * 1e-9) / elapsed_time;
+        double flops = (static_cast<float>(repeat_times) * static_cast<float>(floatPointOperations) * 1e-9) / elapsed_time;
         fprintf(stdout,
-                "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: (%ld).\n",
-                elapsed_time / repeat_times, flops, m);
+                "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: (%u).\n",
+                elapsed_time / static_cast<float>(repeat_times), flops, m);
         fflush(stdout);
 
         // ── 结果写入文件 ──────────────────────────────────────────────────────
@@ -259,7 +259,7 @@ int main(int argc, char **argv) {
         // 以下写入是对同一个已打开流的顺序写入（写指针自动后移），与覆盖/追加模式无关
         fs << "dimensions(m=n) " << m << "\n";
         fs << std::fixed << std::setprecision(6)
-           << "Average elapsed time: (" << elapsed_time / repeat_times << ") s, performance: (";
+           << "Average elapsed time: (" << elapsed_time / static_cast<float>(repeat_times) << ") s, performance: (";
         fs << std::setprecision(1) << flops << ") GFLOPS. size: (" << m << ").\n";
     }
 
