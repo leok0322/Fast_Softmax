@@ -69,12 +69,12 @@ void print_matrix(const float *A, uint M, uint N, std::ofstream &fs) {
 // run_kernel：按 kernel_num 分发到对应的 softmax kernel 实现
 //   参数默认值只需在头文件的函数声明中写，不在定义处重复
 //   deviceIdx：目标 GPU 设备编号（多卡时使用）
-void run_kernel(int kernel_num, uint M, uint N, float *A,
+void run_kernel(int kernel_num, uint totalRow, uint totalCol, float *A,
                 float *out, int deviceIdx) {
     switch (kernel_num) {
-        case 0:  run_softmax_kernel_base(M, N, A, out);  break;
-        case 1:  run_softmax_kernel_naive(M, N, A, out); break;
-        case 2:  run_softmax_kernel_reduction(M, N, A, out); break;
+        case 0:  run_softmax_kernel_base(totalRow, totalCol, A, out);  break;
+        case 1:  run_softmax_kernel_naive(totalRow, totalCol, A, out); break;
+        case 2:  run_softmax_kernel_reduction(totalRow, totalCol, A, out); break;
         case 3:  break;
         case 4:  break;
         case 5:  break;
@@ -227,13 +227,17 @@ int main(int argc, char **argv) {
         elapsed_time /= 1000.f;  // 毫秒 → 秒
 
         // ── FLOPS 计算 ────────────────────────────────────────────────────────
-        // softmax 每行操作数估算：
-        //   Pass1（求 max）: n 次比较
-        //   Pass2（求 exp 之和）: n 次 exp + n 次加法 = 2n
-        //   Pass3（归一化）: n 次 exp + n 次除法 = 2n，+ 常数 3
-        //   共 (n + 2n + 3) 次，m 行，每个输出元素 n 个操作 → ×n（此处按元素级估算）
-        long floatPointOperations = (n + 2 * n + 3) * m * n;
-        double flops = (static_cast<float>(repeat_times) * static_cast<float>(floatPointOperations) * 1e-9) / elapsed_time;
+        // softmax 每行 n 个元素的操作数估算（3 pass）：
+        //   Pass1（求 max）   : n 次 fmaxf                          = n
+        //   Pass2（求 exp 之和）: n 次减法 + n 次 exp + n 次加法    = 3n
+        //   Pass3（归一化）  : n 次减法 + n 次 exp + n 次除法       = 3n
+        //   每行合计：7n 次；m 行总计：7n × m
+        // 修复1：原公式 (n+2n+3)*m*n 多乘了一个 n（应为每行操作数 × 行数，而非 ×m×n）
+        // 修复2：原公式每趟均漏算减法（a[i]-maxval），导致 Pass2/3 各少 n 次操作
+        // 修复3：原为 uint 运算后赋给 long，N≥2048 时超出 UINT_MAX 发生截断，改为 long long
+        long long floatPointOperations = static_cast<long long>(7 * n) * m;
+        // 用 double 避免 float 精度不足（float 只有 ~7 位有效数字，大矩阵时丢失精度）
+        double flops = (static_cast<double>(repeat_times) * static_cast<double>(floatPointOperations) * 1e-9) / elapsed_time;
         fprintf(stdout,
                 "Average elapsed time: (%7.6f) s, performance: (%7.1f) GFLOPS. size: (%u).\n",
                 elapsed_time / static_cast<float>(repeat_times), flops, m);

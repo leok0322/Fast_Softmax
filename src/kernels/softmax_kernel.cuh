@@ -81,22 +81,22 @@ template <typename scalar_t, typename scalar_i>
 __global__ void softmax_kernel_naive(scalar_t* __restrict__ a, scalar_t* __restrict__ out, scalar_i totalRow, scalar_i totalCol) {
 
   // 该block的起始行和列
-  uint initRow {blockIdx.y * blockDim.y};
-  uint initCol {blockIdx.x * blockDim.x};
+  scalar_i initRow {blockIdx.y * blockDim.y};
+  scalar_i initCol {blockIdx.x * blockDim.x};
 
   // 该线程负责的行和列
-  uint row {threadIdx.y};
-  uint col {threadIdx.x};
+  scalar_i row {threadIdx.y};
+  scalar_i col {threadIdx.x};
 
   //
   if ((initRow+row) < totalRow && (initCol+col) < totalCol) {
-    scalar_t maxval = a[(initRow+row)*totalCol];
-    for (uint i = 1; i<totalCol; i++) {
+    float maxval = a[(initRow+row)*totalCol];
+    for (scalar_i i = 1; i<totalCol; i++) {
       maxval = fmaxf(maxval, a[(initRow+row)*totalCol + i]);
     }
 
-    scalar_t divisor = 0.0f;
-    for (uint i = 0; i<totalCol; i++) {
+    float divisor = 0.0f;
+    for (scalar_i i = 0; i<totalCol; i++) {
       divisor += __expf(a[(initRow+row)*totalCol + i] - maxval);
     }
 

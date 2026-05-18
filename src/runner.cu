@@ -17,20 +17,27 @@
 #include "error_check.cuh"  // cudaCheck 宏：包装 CUDA API 调用，失败时打印位置并终止
                              //   cudaCheck(cudaGetLastError()) 用于检测 kernel 启动错误
 
-void run_softmax_kernel_base(int M, int N, float* A, float* out) {
+void run_softmax_kernel_base(uint totalRow, uint totalCol, float* A, float* out) {
   dim3 block_size = dim3(32, 32, 1);
-  uint grid_x =  cuda::ceil_div(M,32);
-  uint grid_y =  cuda::ceil_div(N,32);
+  uint grid_x =  cuda::ceil_div(totalRow,32);
+  uint grid_y =  cuda::ceil_div(totalCol,32);
   dim3 grid_size = dim3(grid_x, grid_y, 1);
-  softmax_kernel_base<float><<<grid_size,block_size>>>(A, out,M, N);
+  softmax_kernel_base<float, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }
 
-void run_softmax_kernel_naive(int M, int N, float* A, float* out) {
+void run_softmax_kernel_naive(uint totalRow, uint totalCol, float* A, float* out) {
   dim3 block_size = dim3(32, 32, 1);
-  uint grid_x =  cuda::ceil_div(M,32);
-  uint grid_y =  cuda::ceil_div(N,32);
+  uint grid_x =  cuda::ceil_div(totalRow,32);
+  uint grid_y =  cuda::ceil_div(totalCol,32);
   dim3 grid_size = dim3(grid_x, grid_y, 1);
-  softmax_kernel_naive<float><<<grid_size,block_size>>>(A, out,M, N);
+  softmax_kernel_naive<float, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
+  cudaCheck(cudaGetLastError());
+}
+
+void run_softmax_kernel_reduction(uint totalRow, uint totalCol, float* A, float* out) {
+  dim3 block_size = dim3(BLOCK_DIM_X, 1, 1);
+  dim3 grid_size = dim3(1, totalRow, 1);
+  softmax_kernel_reduction<float, uint><<<grid_size,block_size>>>(A, out,totalRow, totalCol);
   cudaCheck(cudaGetLastError());
 }
